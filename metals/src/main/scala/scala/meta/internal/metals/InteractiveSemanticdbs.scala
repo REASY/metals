@@ -1,7 +1,8 @@
 package scala.meta.internal.metals
 
 import java.nio.charset.Charset
-import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantReadWriteLock
 
 import scala.util.Success
 import scala.util.Try
@@ -37,9 +38,8 @@ final class InteractiveSemanticdbs(
 ) extends Cancelable
     with Semanticdbs {
 
-  private val textDocumentCache = Collections.synchronizedMap(
-    new java.util.HashMap[AbsolutePath, s.TextDocument]()
-  )
+  private val textDocumentCache =
+    new InteractiveSemanticdbCache[AbsolutePath, s.TextDocument]()
 
   def reset(): Unit = {
     textDocumentCache.clear()
@@ -88,31 +88,30 @@ final class InteractiveSemanticdbs(
     if (isExcludedFile || !shouldTryCalculateInteractiveSemanticdb) {
       TextDocumentLookup.NotFound(source)
     } else {
-      val result = textDocumentCache.compute(
-        source,
-        (path, existingDoc) => {
-          unsavedContents.orElse(sourceText) match {
-            case None => null
-            case Some(text) =>
-              val adjustedText =
-                if (text.startsWith(Shebang.shebang))
-                  "//" + text.drop(2)
-                else text
-              val sha = MD5.compute(adjustedText)
-              if (existingDoc == null || existingDoc.md5 != sha) {
-                compile(path, adjustedText) match {
-                  case Success(doc) if doc != null =>
-                    if (!source.isDependencySource(workspace))
-                      semanticdbIndexer().onChange(source, doc)
-                    doc
-                  case _ => null
-                }
-              } else
-                existingDoc
+      val result = unsavedContents.orElse(sourceText) match {
+        case None => null
+        case Some(text) =>
+          val adjustedText =
+            if (text.startsWith(Shebang.shebang))
+              "//" + text.drop(2)
+            else text
+          val sha = MD5.compute(adjustedText)
+          val lane = buildTargets
+            .inverseSources(source)
+            .map(target =>
+              InteractiveSemanticdbCompilationLane.Target(target.getUri)
+            )
+            .getOrElse(InteractiveSemanticdbCompilationLane.Unmapped)
+          textDocumentCache.compute(source, lane, _.md5 == sha) { path =>
+            compile(path, adjustedText) match {
+              case Success(doc) if doc != null =>
+                if (!source.isDependencySource(workspace))
+                  semanticdbIndexer().onChange(source, doc)
+                doc
+              case _ => null
+            }
           }
-
-        },
-      )
+      }
       TextDocumentLookup.fromOption(source, Option(result))
     }
   }
@@ -143,4 +142,56 @@ final class InteractiveSemanticdbs(
       else compilers().semanticdbTextDocument(source, text)
     }
 
+}
+
+private[metals] final class InteractiveSemanticdbCache[K, V <: AnyRef] {
+  private val values = new ConcurrentHashMap[K, V]()
+  private val lifecycleLock = new ReentrantReadWriteLock()
+  private val compilationLocks =
+    new ConcurrentHashMap[InteractiveSemanticdbCompilationLane, Object]()
+
+  def clear(): Unit = {
+    val lock = lifecycleLock.writeLock()
+    lock.lock()
+    try {
+      values.clear()
+      compilationLocks.clear()
+    } finally lock.unlock()
+  }
+
+  def remove(key: K): Unit = {
+    val lock = lifecycleLock.readLock()
+    lock.lock()
+    try values.remove(key)
+    finally lock.unlock()
+  }
+
+  def compute(
+      key: K,
+      lane: InteractiveSemanticdbCompilationLane,
+      isCurrent: V => Boolean,
+  )(compile: K => V): V = {
+    val lock = lifecycleLock.readLock()
+    lock.lock()
+    try {
+      values.compute(
+        key,
+        (path, existing) =>
+          if (existing != null && isCurrent(existing)) existing
+          else {
+            val compilationLock =
+              compilationLocks.computeIfAbsent(lane, _ => new Object())
+            compilationLock.synchronized(compile(path))
+          },
+      )
+    } finally lock.unlock()
+  }
+}
+
+private[metals] sealed trait InteractiveSemanticdbCompilationLane
+
+private[metals] object InteractiveSemanticdbCompilationLane {
+  case object Unmapped extends InteractiveSemanticdbCompilationLane
+  final case class Target(uri: String)
+      extends InteractiveSemanticdbCompilationLane
 }
