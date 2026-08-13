@@ -120,7 +120,25 @@ class ConnectionProvider(
   val cancelables = new MutableCancelable
   // Can be set only in tests
   var buildServerPromise: Promise[Unit] = Promise[Unit]()
+
+  /**
+   * Completes after BSP target, source, and compiler-option data is populated,
+   * before global workspace and dependency indexes finish.
+   */
+  var buildTargetDataPromise: Promise[Unit] = Promise[Unit]()
   val isConnecting = new AtomicBoolean(false)
+
+  private def completeBuildReadiness(): Unit = {
+    buildTargetDataPromise.trySuccess(())
+    buildServerPromise.trySuccess(())
+    ()
+  }
+
+  private def checkAndCompleteBuildTargetData(): Unit = {
+    check()
+    buildTargetDataPromise.trySuccess(())
+    ()
+  }
 
   override def index(check: () => Unit): Future[Unit] =
     connect(Index(check)).ignoreValue
@@ -136,7 +154,7 @@ class ConnectionProvider(
         if (buildTools.isAutoConnectable(buildToolProvider.optProjectRoot))
           connect(CreateSession())
         else slowConnectToBuildServer(forceImport = false)
-    } yield buildServerPromise.trySuccess(())
+    } yield completeBuildReadiness()
   }
 
   def slowConnectToBuildServer(
@@ -236,7 +254,7 @@ class ConnectionProvider(
           connect(CreateSession())
         }
     } yield {
-      buildServerPromise.trySuccess(())
+      completeBuildReadiness()
       change
     }
 
@@ -476,7 +494,7 @@ class ConnectionProvider(
           saveProjectReferencesInfo(bspBuilds)
         }
         _ = compilers.cancel()
-        buildChange <- index(check)
+        buildChange <- index(checkAndCompleteBuildTargetData)
       } yield buildChange
     }
 
@@ -625,7 +643,7 @@ class ConnectionProvider(
         }
         .flatMap(compileAllOpenFiles(_).withInterrupt)
         .map { res =>
-          buildServerPromise.trySuccess(())
+          completeBuildReadiness()
           res
         }
     }

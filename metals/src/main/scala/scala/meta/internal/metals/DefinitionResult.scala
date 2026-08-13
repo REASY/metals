@@ -3,6 +3,9 @@ package scala.meta.internal.metals
 import java.util
 import java.util.Collections
 
+import scala.concurrent.ExecutionContext
+import scala.concurrent.Future
+
 import scala.meta.internal.metals.MetalsEnrichments._
 import scala.meta.internal.semanticdb.Scala.Symbols
 import scala.meta.internal.semanticdb.TextDocument
@@ -31,4 +34,15 @@ object DefinitionResult {
   def empty(symbol: String): DefinitionResult =
     DefinitionResult(Collections.emptyList(), symbol, None, None, symbol)
   def empty: DefinitionResult = empty(Symbols.None)
+
+  private[metals] def retryEmptyAfter(
+      initial: Future[DefinitionResult],
+      indexingReady: Option[Future[Unit]],
+  )(retry: => Future[DefinitionResult])(implicit
+      ec: ExecutionContext
+  ): Future[DefinitionResult] =
+    initial.flatMap { result =>
+      if (!result.isEmpty) Future.successful(result)
+      else indexingReady.fold(Future.successful(result))(_.flatMap(_ => retry))
+    }
 }

@@ -98,6 +98,7 @@ class ProjectMetalsLspService(
 
   override def indexer: Indexer = connectionProvider
   def buildServerPromise = connectionProvider.buildServerPromise
+  def buildTargetDataPromise = connectionProvider.buildTargetDataPromise
   def connect[T](config: ConnectRequest): Future[BuildChange] =
     connectionProvider.Connect.connect(config)
 
