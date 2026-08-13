@@ -61,6 +61,7 @@ class FallbackMetalsLspService(
     ) {
 
   val buildServerPromise: Promise[Unit] = Promise.successful(())
+  val buildTargetDataPromise: Promise[Unit] = Promise.successful(())
   indexingPromise.success(())
 
   override protected def fileDecoderProvider: FileDecoderProvider =

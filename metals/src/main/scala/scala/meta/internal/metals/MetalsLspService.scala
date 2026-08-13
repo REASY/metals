@@ -236,10 +236,11 @@ abstract class MetalsLspService(
   )
   var indexingPromise: Promise[Unit] = Promise[Unit]()
   def buildServerPromise: Promise[Unit]
+  def buildTargetDataPromise: Promise[Unit]
   val parseTrees = new BatchedFunction[AbsolutePath, Unit](
     paths =>
       CancelableFuture(
-        buildServerPromise.future
+        buildTargetDataPromise.future
           .flatMap(_ => parseTreesAndPublishDiags(paths))
           .ignoreValue,
         Cancelable.empty,
@@ -785,7 +786,7 @@ abstract class MetalsLspService(
      * sources and standalone files, but wait for build tool information, so
      * that we don't try to generate it for project files
      */
-    val interactive = buildServerPromise.future.map { _ =>
+    val interactive = buildTargetDataPromise.future.map { _ =>
       interactiveSemanticdbs.textDocument(path)
     }
 
@@ -794,7 +795,7 @@ abstract class MetalsLspService(
     val semanticReadiness =
       if (path.isDependencySource(folder)) parser
       else
-        buildServerPromise.future.flatMap { _ =>
+        buildTargetDataPromise.future.flatMap { _ =>
           def load(): Future[Unit] = {
             Future
               .sequence(
@@ -1813,14 +1814,21 @@ abstract class MetalsLspService(
   ): Future[DefinitionResult] = {
     val source = position.getTextDocument.getUri.toAbsolutePath
     if (source.isScalaFilename || source.isJavaFilename) {
-      val result = openedFileSemanticReadiness
+      def queryDefinition(): Future[DefinitionResult] =
+        timerProvider.timedThunk(
+          "definition",
+          clientConfig.initialConfig.statistics.isDefinition,
+        )(definitionProvider.definition(source, position, token))
+      val initial = openedFileSemanticReadiness
         .await(source)
-        .flatMap { _ =>
-          timerProvider.timedThunk(
-            "definition",
-            clientConfig.initialConfig.statistics.isDefinition,
-          )(definitionProvider.definition(source, position, token))
-        }
+        .flatMap(_ => queryDefinition())
+      val retryAfterIndexing = Option.when(!buildServerPromise.isCompleted)(
+        buildServerPromise.future
+      )
+      val result = DefinitionResult.retryEmptyAfter(
+        initial,
+        retryAfterIndexing,
+      )(queryDefinition())
       result.onComplete {
         case Success(value) =>
           // Record what build target this dependency source (if any) was jumped from,

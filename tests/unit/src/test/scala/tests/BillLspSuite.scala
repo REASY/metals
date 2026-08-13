@@ -1,6 +1,7 @@
 package tests
 
 import scala.concurrent.Future
+import scala.concurrent.Promise
 
 import scala.meta.internal.metals.Directories
 import scala.meta.internal.metals.Messages
@@ -78,6 +79,28 @@ class BillLspSuite extends BaseLspSuite("bill") with TestHovers {
            |val answer: Int
            |```""".stripMargin,
       )
+    } yield ()
+  }
+
+  test("opened-file-preparation-before-global-index-readiness") {
+    cleanWorkspace()
+    Bill.installWorkspace(workspace)
+    for {
+      _ <- initialize(
+        """
+          |/src/com/App.scala
+          |object App {
+          |  val answer = 42
+          |}
+        """.stripMargin
+      )
+      _ = server.headServer.connectionProvider.buildServerPromise =
+        Promise[Unit]()
+      _ <- server.didOpen("src/com/App.scala")
+      _ = assert(
+        !server.headServer.connectionProvider.buildServerPromise.isCompleted
+      )
+      _ = server.headServer.connectionProvider.buildServerPromise.success(())
     } yield ()
   }
 
