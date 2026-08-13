@@ -142,6 +142,14 @@ case class ScalaTarget(
 
   def scalaVersion: String = scalaInfo.getScalaVersion()
 
+  /**
+   * Jars required to compile this target, as reported by BSP. These can be
+   * absent from scalac's classpath when the build tool manages the Scala
+   * boot classpath separately.
+   */
+  def scalaJars: List[String] =
+    Option(scalaInfo.getJars()).fold(List.empty[String])(_.asScala.toList)
+
   def id: BuildTargetIdentifier = info.getId()
 
   def scalaBinaryVersion: String = scalaInfo.getScalaBinaryVersion()

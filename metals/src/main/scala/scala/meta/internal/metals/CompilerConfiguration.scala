@@ -217,10 +217,20 @@ class CompilerConfiguration(
         if (scalaTarget.isBestEffort) Seq(scalaTarget.bestEffortPath)
         else Seq.empty
 
+      val targetScalaJars =
+        scalaTarget.scalaJars.toAbsoluteClasspath.map(_.toNIO)
+
+      val compilerClasspath =
+        (classpath.iterator ++
+          targetScalaJars ++
+          additionalClasspath.iterator ++
+          bestEffortDirs.iterator ++
+          selfBestEffortDir.iterator).toSeq.distinct
+
       fromMtags(
         mtags,
         nonBestEffortOptions,
-        classpath ++ additionalClasspath ++ bestEffortDirs ++ selfBestEffortDir,
+        compilerClasspath,
         name,
         search,
         referenceCounter,

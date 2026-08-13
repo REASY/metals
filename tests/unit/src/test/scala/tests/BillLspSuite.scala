@@ -12,7 +12,7 @@ import scala.meta.io.AbsolutePath
 import bill._
 import ch.epfl.scala.bsp4j.StatusCode
 
-class BillLspSuite extends BaseLspSuite("bill") {
+class BillLspSuite extends BaseLspSuite("bill") with TestHovers {
 
   def globalBsp: AbsolutePath = workspace.resolve("global-bsp")
   override def bspGlobalDirectories: List[AbsolutePath] =
@@ -51,6 +51,34 @@ class BillLspSuite extends BaseLspSuite("bill") {
     cleanWorkspace()
     Bill.installWorkspace(workspace)
     testRoundtripCompilation()
+  }
+
+  test("presentation-compiler-scala-jars-outside-scalac-classpath") {
+    cleanWorkspace()
+    Bill.installWorkspace(workspace)
+    for {
+      _ <- initialize(
+        """
+          |/filter-scala-jars
+          |true
+          |/src/com/App.scala
+          |object App {
+          |  val answer = 42
+          |}
+        """.stripMargin
+      )
+      _ <- server.assertHover(
+        "src/com/App.scala",
+        """
+          |object App {
+          |  val ans@@wer = 42
+          |}
+        """.stripMargin,
+        """|```scala
+           |val answer: Int
+           |```""".stripMargin,
+      )
+    } yield ()
   }
 
   test("stale-bloop-prefers-custom-bsp") {

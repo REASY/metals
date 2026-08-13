@@ -371,13 +371,17 @@ object Bill {
     override def buildTargetScalacOptions(
         params: ScalacOptionsParams
     ): CompletableFuture[ScalacOptionsResult] = {
+      val classpath =
+        if (Files.isRegularFile(workspace.resolve("filter-scala-jars")))
+          List(out.toURI.toASCIIString).asJava
+        else scalaJars
       CompletableFuture.completedFuture {
         new ScalacOptionsResult(
           List(
             new ScalacOptionsItem(
               target.getId,
               List().asJava,
-              scalaJars,
+              classpath,
               out.toURI.toASCIIString,
             )
           ).asJava
