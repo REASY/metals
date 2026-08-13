@@ -5,6 +5,8 @@ import java.util.concurrent.CompletableFuture
 
 import scala.meta.internal.metals.DidFocusResult
 import scala.meta.internal.metals.HoverExtParams
+import scala.meta.internal.metals.SemanticdbTextDocumentsParams
+import scala.meta.internal.metals.SemanticdbTextDocumentsResult
 import scala.meta.internal.metals.clients.language.MetalsTerminalInputParams
 import scala.meta.internal.metals.doctor.DoctorVisibilityDidChangeParams
 import scala.meta.internal.metals.findfiles.FindTextInDependencyJarsRequest
@@ -33,6 +35,11 @@ import org.eclipse.lsp4j.jsonrpc.messages.{Either => JEither}
 class DelegatingScalaService(
     @volatile var underlying: ScalaLspService
 ) extends ScalaLspService {
+
+  override def semanticdbTextDocuments(
+      params: SemanticdbTextDocumentsParams
+  ): CompletableFuture[SemanticdbTextDocumentsResult] =
+    underlying.semanticdbTextDocuments(params)
 
   override def didOpen(
       params: DidOpenTextDocumentParams

@@ -881,6 +881,26 @@ class WorkspaceLspService(
   ): CompletableFuture[ju.List[Location]] =
     collectSeq(_.findTextInDependencyJars(params))(_.flatten.asJava).asJava
 
+  override def semanticdbTextDocuments(
+      params: SemanticdbTextDocumentsParams
+  ): CompletableFuture[SemanticdbTextDocumentsResult] = {
+    val groupedUris = params.uris.asScala.groupBy(uri => getServiceFor(uri))
+    val result = Future
+      .sequence(groupedUris.map { case (service, uris) =>
+        service.semanticdbTextDocuments(
+          SemanticdbTextDocumentsParams(uris.asJava)
+        )
+      })
+      .map { results =>
+        val documents = results.flatMap(_.documents.asScala).toSeq.sortBy(_.uri)
+        SemanticdbTextDocumentsResult(
+          SemanticdbTextDocumentsResult.SchemaVersion,
+          documents.asJava,
+        )
+      }
+    result.asJava
+  }
+
   override def didCancelWorkDoneProgress(
       params: lsp4j.WorkDoneProgressCancelParams
   ): Unit = workDoneProgress.canceled(params.getToken())

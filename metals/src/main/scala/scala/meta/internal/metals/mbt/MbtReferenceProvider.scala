@@ -357,6 +357,14 @@ class MbtReferenceProvider(
       }
   }
 
+  def textDocuments(paths: Seq[AbsolutePath]): s.TextDocuments = {
+    val documents = for {
+      group <- groupPathsForIndexing(paths.distinct.sortBy(_.toString))
+      document <- cache.index(group).documents
+    } yield document
+    s.TextDocuments(documents = documents.toSeq.sortBy(_.uri))
+  }
+
   def references(
       params: ReferenceParams,
       findRealRange: AdjustRange = noAdjustRange,

@@ -1562,6 +1562,15 @@ abstract class MetalsLspService(
       }
     }
 
+  def semanticdbTextDocuments(
+      params: SemanticdbTextDocumentsParams
+  ): Future[SemanticdbTextDocumentsResult] = Future {
+    val paths = params.uris.asScala.map(_.toAbsolutePath).toSeq
+    SemanticdbTextDocumentsResult.fromSemanticdb(
+      mbtReferenceProvider.textDocuments(paths)
+    )
+  }
+
   private def getSortedLocations(referencesResult: List[ReferencesResult]) =
     referencesResult
       .flatMap(_.locations)

@@ -4,6 +4,8 @@ import java.util
 import java.util.concurrent.CompletableFuture
 
 import scala.meta.internal.metals.DidFocusResult
+import scala.meta.internal.metals.SemanticdbTextDocumentsParams
+import scala.meta.internal.metals.SemanticdbTextDocumentsResult
 import scala.meta.internal.metals.clients.language.MetalsTerminalInputParams
 import scala.meta.internal.metals.doctor.DoctorVisibilityDidChangeParams
 import scala.meta.internal.metals.findfiles.FindTextInDependencyJarsRequest
@@ -29,6 +31,11 @@ case class MetalsSyncParams(
  * implemented by Metals.
  */
 trait MetalsService {
+  @JsonRequest("metals/semanticdbTextDocuments")
+  def semanticdbTextDocuments(
+      params: SemanticdbTextDocumentsParams
+  ): CompletableFuture[SemanticdbTextDocumentsResult]
+
   @JsonRequest("metals/treeViewChildren")
   def treeViewChildren(
       params: TreeViewChildrenParams
