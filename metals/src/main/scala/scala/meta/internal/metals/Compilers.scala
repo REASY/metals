@@ -249,8 +249,8 @@ class Compilers(
           .filter(_.isScalaFilename)
           .flatMap(path => buildTargets.inverseSources(path).toList)
           .distinct
-        targets.foreach { target =>
-          loadCompiler(target).foreach { pc =>
+        targets.flatMap { target =>
+          loadCompiler(target).map { pc =>
             pc
               .hover(
                 CompilerOffsetParams(
@@ -259,10 +259,11 @@ class Compilers(
                   "object Ma".length(),
                 )
               )
-              .thenApply(_.map(_.toLsp()))
+              .asScala
+              .ignoreValue
           }
         }
-      }
+      }.flatMap(Future.sequence(_).ignoreValue)
     }
 
   def didClose(path: AbsolutePath): Unit = {

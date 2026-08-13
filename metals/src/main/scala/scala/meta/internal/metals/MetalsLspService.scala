@@ -407,6 +407,9 @@ abstract class MetalsLspService(
     )
   }
 
+  private val openedFileSemanticReadiness =
+    new OpenedFileSemanticReadiness[AbsolutePath]()
+
   protected val symbolSearch: MetalsSymbolSearch = new MetalsSymbolSearch(
     symbolDocs,
     workspaceSymbols,
@@ -788,26 +791,26 @@ abstract class MetalsLspService(
 
     val parser = parseTrees(path)
 
-    if (path.isDependencySource(folder)) {
-      parser.asJava
-    } else {
-      buildServerPromise.future.flatMap { _ =>
-        def load(): Future[Unit] = {
-          Future
-            .sequence(
-              List(
-                compilations.compileFile(path, assumeDidNotChange = true),
-                compilers.load(List(path)),
-                parser,
-                interactive,
-                testProvider.didOpen(path),
+    val semanticReadiness =
+      if (path.isDependencySource(folder)) parser
+      else
+        buildServerPromise.future.flatMap { _ =>
+          def load(): Future[Unit] = {
+            Future
+              .sequence(
+                List(
+                  compilations.compileFile(path, assumeDidNotChange = true),
+                  compilers.load(List(path)),
+                  parser,
+                  interactive,
+                  testProvider.didOpen(path),
+                )
               )
-            )
-            .ignoreValue
+              .ignoreValue
+          }
+          maybeImportFileAndLoad(path, load)
         }
-        maybeImportFileAndLoad(path, load)
-      }.asJava
-    }
+    openedFileSemanticReadiness.track(path, semanticReadiness).asJava
   }
 
   def maybeImportFileAndLoad(
@@ -875,6 +878,7 @@ abstract class MetalsLspService(
 
   override def didClose(params: DidCloseTextDocumentParams): Unit = {
     val path = params.getTextDocument.getUri.toAbsolutePath
+    openedFileSemanticReadiness.remove(path)
     buffers.remove(path)
     compilers.didClose(path)
     trees.didClose(path)
@@ -1809,13 +1813,14 @@ abstract class MetalsLspService(
   ): Future[DefinitionResult] = {
     val source = position.getTextDocument.getUri.toAbsolutePath
     if (source.isScalaFilename || source.isJavaFilename) {
-      val result =
-        timerProvider.timedThunk(
-          "definition",
-          clientConfig.initialConfig.statistics.isDefinition,
-        )(
-          definitionProvider.definition(source, position, token)
-        )
+      val result = openedFileSemanticReadiness
+        .await(source)
+        .flatMap { _ =>
+          timerProvider.timedThunk(
+            "definition",
+            clientConfig.initialConfig.statistics.isDefinition,
+          )(definitionProvider.definition(source, position, token))
+        }
       result.onComplete {
         case Success(value) =>
           // Record what build target this dependency source (if any) was jumped from,
