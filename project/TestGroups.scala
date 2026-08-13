@@ -22,6 +22,7 @@ object TestGroups {
     "tests.WorkspaceSymbolExpectSuite", "tests.digest.DigestsSuite",
     "tests.MtagsSuite", "tests.ChosenBuildServerSuite", "tests.SemanticdbSuite",
     "scala.meta.internal.metals.InteractiveSemanticdbCacheSuite",
+    "scala.meta.internal.metals.OpenedFileSemanticReadinessSuite",
     "tests.digest.MillDigestSuite", "tests.DocumentSymbolSuite",
     "tests.FoldingRangeSuite", "tests.JavadocSuite",
     "tests.MtagsEnrichmentsSuite", "tests.MtagsResolverSuite",
