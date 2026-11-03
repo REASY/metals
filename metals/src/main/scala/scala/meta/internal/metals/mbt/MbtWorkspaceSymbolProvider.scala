@@ -37,11 +37,6 @@ import scala.meta.internal.jsemanticdb.Semanticdb
 import scala.meta.internal.metals.BaseFallbackClasspaths
 import scala.meta.internal.metals.BaseWorkDoneProgress
 import scala.meta.internal.metals.Buffers
-import scala.meta.internal.metals.Configs.JavaSymbolLoaderConfig
-import scala.meta.internal.metals.Configs.ProtobufLspConfig
-import scala.meta.internal.metals.Configs.TurbineCacheConfig
-import scala.meta.internal.metals.Configs.TurbineRecompileDelayConfig
-import scala.meta.internal.metals.Configs.WorkspaceSymbolProviderConfig
 import scala.meta.internal.metals.Directories
 import scala.meta.internal.metals.EmptyFallbackClasspaths
 import scala.meta.internal.metals.EmptyWorkDoneProgress
@@ -50,12 +45,15 @@ import scala.meta.internal.metals.LoggerReportContext
 import scala.meta.internal.metals.MetalsEnrichments._
 import scala.meta.internal.metals.ReportContext
 import scala.meta.internal.metals.Sleeper
+import scala.meta.internal.metals.StringBloomFilter
 import scala.meta.internal.metals.Time
 import scala.meta.internal.metals.Timer
 import scala.meta.internal.metals.WorkspaceSymbolQuery
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.metals.debug.BuildTargetClasses
 import scala.meta.internal.mtags.Mtags
 import scala.meta.internal.mtags.Symbol
+import scala.meta.internal.pc.PcSymbolInformation
 import scala.meta.internal.tokenizers.UnexpectedInputEndException
 import scala.meta.io.AbsolutePath
 import scala.meta.metals.MetalsLanguageServer
@@ -76,43 +74,31 @@ case class MbtWorkspaceSymbolSearchParams(
 case class MbtPossibleReferencesParams(
     references: collection.Seq[String] = Nil,
     implementations: collection.Seq[String] = Nil,
+    toplevelImplementationsOnly: Boolean = false,
 )
 
 object MbtWorkspaceSymbolProvider {
+
   def isRelevantPath(file: String): Boolean = {
     file.endsWith(".java") ||
     file.endsWith(".proto") ||
     file.endsWith(".scala")
   }
-  def forTesting(): MbtWorkspaceSymbolProvider = {
-    val tmp = Files.createTempDirectory("mbt-workspace-symbol-provider")
-    tmp.toFile().deleteOnExit()
-    new MbtWorkspaceSymbolProvider(AbsolutePath(tmp))
-  }
 }
 
 class MbtWorkspaceSymbolProvider(
     val workspace: AbsolutePath,
-    config: () => WorkspaceSymbolProviderConfig = () =>
-      WorkspaceSymbolProviderConfig.mbt,
+    userConfig: () => UserConfiguration,
     buffers: Buffers = Buffers(),
     time: Time = Time.system,
     metrics: MonitoringClient = new NoopMonitoringClient(),
     mtags: () => Mtags = () => Mtags.testingSingleton,
     progress: BaseWorkDoneProgress = EmptyWorkDoneProgress,
     onIndexingDone: () => Unit = () => (),
-    javaSymbolLoader: () => JavaSymbolLoaderConfig = () =>
-      JavaSymbolLoaderConfig.default,
     fallbackClasspaths: () => BaseFallbackClasspaths = () =>
       EmptyFallbackClasspaths,
     sleeper: Sleeper = Sleeper.TestingSleeper,
-    turbineRecompileDelay: () => TurbineRecompileDelayConfig = () =>
-      TurbineRecompileDelayConfig.fromConfig(None),
-    turbineCacheConfig: () => TurbineCacheConfig = () =>
-      TurbineCacheConfig.default,
     indexFilters: List[MbtIndexFilter] = MbtIndexFilter.allFilters,
-    protobufLspConfig: () => ProtobufLspConfig = () =>
-      ProtobufLspConfig.default,
     metalsOutDir: Option[Path] = None,
     mbtBuild: () => MbtBuild = () => MbtBuild.empty,
 )(implicit
@@ -132,9 +118,13 @@ class MbtWorkspaceSymbolProvider(
   private val isIndexing: AtomicBoolean = new AtomicBoolean(false)
   private lazy val protobufWorkspace = new MbtProtobufWorkspaceSymbolProvider(
     buffers,
-    protobufLspConfig,
+    userConfig,
     clearAllProtobufCaches,
   )
+
+  private def isProtoJavaPackageIndexingEnabled: Boolean =
+    protobufWorkspace.isJavaPackageIndexingEnabled ||
+      userConfig().javaSymbolLoader.isTurbineClasspath
 
   /**
    * The Java outlines synthesized from the given `.proto` file (one per
@@ -146,8 +136,7 @@ class MbtWorkspaceSymbolProvider(
 
   private val turbineCache = new TurbineCache(
     workspace,
-    turbineCacheConfig,
-    turbineRecompileDelay,
+    userConfig,
     time,
   )
 
@@ -228,7 +217,7 @@ class MbtWorkspaceSymbolProvider(
       progress,
       // We don't need to re-compile the workspace super regularly because we can
       // load recently changed files from the sourcepath.
-      () => turbineRecompileDelay(),
+      () => userConfig().javaTurbineRecompileDelay,
       listProtoJavaOutlinesForPackage = pkg =>
         protobufWorkspace.listProtoJavaOutlinesForPackage(
           pkg,
@@ -268,6 +257,22 @@ class MbtWorkspaceSymbolProvider(
     }
   }
 
+  def classesForPath(relativePath: String): List[String] = {
+    documents
+      .get(workspace.resolve(relativePath))
+      .map(
+        _.symbols
+          .collect {
+            case symInfo
+                if symInfo.getKind == Semanticdb.SymbolInformation.Kind.CLASS || symInfo.getKind == Semanticdb.SymbolInformation.Kind.OBJECT =>
+              symInfo.getSymbol()
+          }
+          .toList
+      )
+      .getOrElse(Nil)
+      .filter(sym => Symbol(sym).isToplevel)
+  }
+
   /**
    * Excludes proto-generated classes that were compiled into the turbine
    * classpath from a previous version of the given proto file. Javac keeps
@@ -279,16 +284,16 @@ class MbtWorkspaceSymbolProvider(
       file: AbsolutePath,
       doc: IndexedDocument,
   ): Unit = {
-    if (javaSymbolLoader().isTurbineClasspath) {
-      val binaryNames = doc.cachedJavaOutlines
-        .flatMap(_.toplevelSymbols().asScala)
-        .map(_.stripSuffix("#").stripSuffix("."))
+    if (userConfig().javaSymbolLoader.isTurbineClasspath) {
+      val binaryNames =
+        ProtoOutlineTypes.declaredBy(doc.cachedJavaOutlines, mtags())
       if (binaryNames.nonEmpty) {
         turbineCompiler.onDidDelete(binaryNames, file.toURI.toString())
         turbineCompiler.scheduleCompile().ignoreValue
       }
     }
   }
+
   private def clearAllProtobufCaches(): Unit = {
     documentsKeys.foreach { path =>
       if (path.isProtoFilename) {
@@ -343,7 +348,7 @@ class MbtWorkspaceSymbolProvider(
   }
 
   private def onReindexInternal(): IndexingStats = {
-    if (!config().isMBT) {
+    if (!userConfig().workspaceSymbolProvider.isMBT) {
       scribe.warn(s"mbt-v2: config is not mbt-v2, skipping reindex")
       return IndexingStats.empty
     }
@@ -452,7 +457,7 @@ class MbtWorkspaceSymbolProvider(
               // can optimize.
               synchronizeWithGitStatus()
             },
-            if (javaSymbolLoader().isTurbineClasspath) {
+            if (userConfig().javaSymbolLoader.isTurbineClasspath) {
               turbineCompiler.compileNow()
             } else {
               Future.unit
@@ -504,7 +509,9 @@ class MbtWorkspaceSymbolProvider(
         // If Java file, treat deletion as a change to an empty file.
         // This adds an empty source to SOURCE_PATH so javac won't find the class.
         // We also track deleted binary names to exclude from CLASS_PATH.
-        if (doc.language.isJava && javaSymbolLoader().isTurbineClasspath) {
+        if (
+          doc.language.isJava && userConfig().javaSymbolLoader.isTurbineClasspath
+        ) {
           val binaryNames = doc.symbols
             .map(_.getSymbol())
             .filter(sym => Symbol(sym).isToplevel)
@@ -547,7 +554,7 @@ class MbtWorkspaceSymbolProvider(
   ): Future[Unit] = try {
     if (MbtIndexFilter.included(indexFilters, MbtFileCandidate(file))) {
       val enableProtoJavaPackage =
-        file.isProtoFilename && protobufWorkspace.isJavaPackageIndexingEnabled
+        file.isProtoFilename && isProtoJavaPackageIndexingEnabled
       val mdoc =
         IndexedDocument.fromFile(
           file,
@@ -584,7 +591,7 @@ class MbtWorkspaceSymbolProvider(
       standardFileManager: StandardJavaFileManager,
       classpath: ju.List[Path],
   ): JavaFileManager = {
-    if (javaSymbolLoader().isJavacSourcepath) {
+    if (userConfig().javaSymbolLoader.isJavacSourcepath) {
       new JavacSourcepathFileManager(
         standardFileManager,
         (pkg) => {
@@ -615,11 +622,11 @@ class MbtWorkspaceSymbolProvider(
           }
         },
       )
-    } else if (javaSymbolLoader().isTurbineClasspath) {
+    } else if (userConfig().javaSymbolLoader.isTurbineClasspath) {
       turbineCompiler.createFileManager(standardFileManager, classpath)
     } else {
       throw new IllegalArgumentException(
-        s"unexpected javaSymbolLoader config: ${javaSymbolLoader()}"
+        s"unexpected javaSymbolLoader config: ${userConfig().javaSymbolLoader}"
       )
     }
   }
@@ -683,137 +690,223 @@ class MbtWorkspaceSymbolProvider(
    * Extracts potential main class candidates from the MBT index without loading semanticdb.
    * Returns candidates that need to be confirmed via semanticdb before use.
    *
-   * Candidates are identified by:
+   * Candidates are identified by a single parallel pass over the index:
    * 1. Symbols ending in "#main()." or ".main()." (Java/Scala main methods)
-   * 2. Files referencing "scala/main#" (@main annotation)
-   * 3. Files referencing "scala/App#" (App trait extension)
+   * 2. Files whose bloom filter contains a `main#` identifier (@main annotation)
+   * 3. Files whose bloom filter contains an `App:` parent identifier (App trait)
    */
   def candidateMainClasses(
       filterPath: AbsolutePath => Boolean
   ): Seq[BuildTargetClasses.MainClassCandidate] = {
-    val candidates =
-      scala.collection.mutable.ArrayBuffer
-        .empty[BuildTargetClasses.MainClassCandidate]
     val javaMain = "#main()."
     val scalaMain = ".main()."
-    val mainAnnotRef = FingerprintedCharSequence.fuzzyReference("scala/main#")
-    val appRef = FingerprintedCharSequence.fuzzyReference("scala/App#")
-    val pathsFromMainSymbols =
-      queryWorkspaceSymbol("main")
-        .flatMap(info => Option(info.getLocation()))
-        .map(_.getUri.toAbsolutePath)
-    val pathsFromReferences =
-      possibleReferences(
-        MbtPossibleReferencesParams(
-          references = Seq(mainAnnotRef.value.toString, appRef.value.toString)
-        )
-      )
-    for {
-      path <- pathsFromMainSymbols.distinct
-      if filterPath(path)
-      doc <- documents.get(path).toList
-    } {
+    val hasher = StringBloomFilter.forEstimatedSize(0)
+    val mainAnnotHash = hasher.computeHashCode(
+      FingerprintedCharSequence.fuzzyReference("main#")
+    )
+    val appParentHash = hasher.computeHashCode(
+      FingerprintedCharSequence.fuzzyReference("App:")
+    )
+    val candidates =
+      new ju.concurrent.ConcurrentLinkedQueue[
+        BuildTargetClasses.MainClassCandidate
+      ]
 
-      // Check for main method symbols in the document
+    for {
+      path <- documentsKeys
+      if filterPath(path)
+      doc <- documents.get(path).toList.iterator
+    } {
+      val hasMainAnnot = doc.bloomFilter.mightContain(mainAnnotHash)
+      val hasApp = doc.bloomFilter.mightContain(appParentHash)
+      val fileCandidates =
+        scala.collection.mutable.ArrayBuffer
+          .empty[BuildTargetClasses.MainClassCandidate]
       for (symbolInfo <- doc.symbols) {
         val symbol = symbolInfo.getSymbol()
-        // Java main method pattern: com/example/Main#main().
-        if (symbol.endsWith(javaMain)) {
-          val classSymbol = symbol.stripSuffix("main().")
-          candidates += BuildTargetClasses.MainClassCandidate(path, classSymbol)
-        }
-        // Scala main method pattern: com/example/Main.main().
-        else if (symbol.endsWith(scalaMain)) {
-          val objectSymbol = symbol.stripSuffix("main().")
-          candidates += BuildTargetClasses.MainClassCandidate(
+        if (symbol.endsWith(javaMain) || symbol.endsWith(scalaMain)) {
+          fileCandidates += BuildTargetClasses.MainClassCandidate(
             path,
-            objectSymbol,
+            symbol.stripSuffix("main()."),
           )
-        }
-      }
-    }
-
-    for {
-      path <- pathsFromReferences
-      if filterPath(path)
-      doc <- documents.get(path).toList
-    } {
-      // Check bloom filter for @main annotation reference
-      if (doc.bloomFilter.mightContain(mainAnnotRef)) {
-        // For @main annotated methods, we need to find method symbols
-        // that could be annotated. We'll add all method symbols as candidates.
-        for (symbolInfo <- doc.symbols) {
-          val symbol = symbolInfo.getSymbol()
+        } else {
           val kind = symbolInfo.getKind()
-          // Methods that could have @main annotation
-          if (kind == Semanticdb.SymbolInformation.Kind.METHOD) {
-            candidates += BuildTargetClasses.MainClassCandidate(path, symbol)
+          /*
+           * We have a potential main annot and there exists a method,
+           * which is enough to consider the file a main class candidate.
+           */
+          if (
+            hasMainAnnot &&
+            kind == Semanticdb.SymbolInformation.Kind.METHOD
+          ) {
+            fileCandidates += BuildTargetClasses.MainClassCandidate(
+              path,
+              symbol,
+            )
+            /*
+             * Same thing as above, but an App is present.
+             */
+          } else if (
+            hasApp &&
+            kind == Semanticdb.SymbolInformation.Kind.OBJECT &&
+            Symbol(symbol).isToplevel
+          ) {
+            fileCandidates += BuildTargetClasses.MainClassCandidate(
+              path,
+              symbol,
+            )
           }
         }
       }
-      // For App extension, we add class/object symbols as candidates
-      for (symbolInfo <- doc.symbols) {
-        val symbol = symbolInfo.getSymbol()
-        val kind = symbolInfo.getKind()
-        if (
-          kind == Semanticdb.SymbolInformation.Kind.OBJECT &&
-          Symbol(symbol).isToplevel
-        ) {
-          candidates += BuildTargetClasses.MainClassCandidate(path, symbol)
-        }
-
+      if (fileCandidates.nonEmpty) {
+        fileCandidates.foreach(candidates.add)
       }
     }
-    candidates.toSeq
+    candidates.asScala.toSeq
   }
 
   /**
-   * BFS through the inheritance chain starting from the given symbols.
-   * Returns all files that transitively reference those symbols as parents.
+   * Files that may contain test classes: annotation references (JUnit/TestNG)
+   * plus a BFS over test-framework parent types (ScalaTest/MUnit/...) and
+   * top-level types declared in annotation-hit files.
    *
-   * At each level, top-level traits and classes defined in the current
-   * frontier files are extracted from the MBT index and used as seeds for
-   * the next [[possibleReferences]] call. Already-visited paths are excluded
-   * to prevent cycles.
+   * Annotation hits are candidates. Their top-level classes, traits, and
+   * interfaces are added to the BFS seed set so subclasses without their own
+   * annotations (e.g. `class SubTest extends BaseTest`) are still discovered.
+   * The annotation files themselves are not the first frontier, so later BFS
+   * levels expand only newly found subclasses rather than every `@Test` suite.
+   *
+   * Inheritance BFS, at every level, seeds the next query with all top-level
+   * traits, interfaces, and classes of the matched files, so JUnit 3
+   * `TestCase` subclasses and custom test bases both chain.
    */
   private def transitiveReferenceFiles(
       references: Seq[String],
       implementations: Seq[String],
   ): Set[AbsolutePath] = {
     val allMatchedPaths = scala.collection.mutable.HashSet.empty[AbsolutePath]
-    var frontier: Set[AbsolutePath] = possibleReferences(
-      MbtPossibleReferencesParams(
-        references = references,
-        implementations = implementations,
-      )
-    )
+    val annotationFiles =
+      if (references.isEmpty) Set.empty[AbsolutePath]
+      else
+        possibleReferences(
+          MbtPossibleReferencesParams(references = references)
+        )
+    allMatchedPaths ++= annotationFiles
+
+    val initialImplementations =
+      implementations ++ annotationFiles.flatMap(bfsSeedSymbols)
+    var frontier: Set[AbsolutePath] =
+      if (initialImplementations.isEmpty) Set.empty
+      else subtypeFiles(initialImplementations) -- allMatchedPaths
 
     while (frontier.nonEmpty) {
       allMatchedPaths ++= frontier
-
-      val nextBaseSymbols = frontier.flatMap { path =>
-        documents.get(path).toSeq.flatMap { doc =>
-          doc.symbols
-            .filter { sym =>
-              val kind = sym.getKind()
-              (kind == Semanticdb.SymbolInformation.Kind.TRAIT ||
-                kind == Semanticdb.SymbolInformation.Kind.CLASS) &&
-              Symbol(sym.getSymbol()).isToplevel
-            }
-            .map(_.getSymbol())
-        }
-      }.toSeq
-
+      val nextBaseSymbols = frontier.flatMap(bfsSeedSymbols).toSeq
       frontier =
         if (nextBaseSymbols.isEmpty) Set.empty
-        else
-          possibleReferences(
-            MbtPossibleReferencesParams(implementations = nextBaseSymbols)
-          ) -- allMatchedPaths
+        else subtypeFiles(nextBaseSymbols) -- allMatchedPaths
     }
 
     allMatchedPaths.toSet
   }
+
+  /**
+   * Files declaring a type whose parents include one of `baseSymbols`.
+   *
+   * The bloom filter query is only a prefilter: with thousands of base
+   * symbols, false positives compound until most of the workspace matches.
+   * Keep a match only if one of its indexed symbols declares a parent with
+   * the same simple name as a base symbol.
+   */
+  private def subtypeFiles(baseSymbols: Seq[String]): Set[AbsolutePath] = {
+    val baseNames = baseSymbols.map(Symbol(_).displayName).toSet
+    val bloomMatches = possibleReferences(
+      MbtPossibleReferencesParams(
+        implementations = baseSymbols,
+        toplevelImplementationsOnly = true,
+      )
+    )
+    bloomMatches.filter { path =>
+      documents
+        .get(path)
+        .exists(
+          _.symbols.exists(_.getParentNamesList().asScala.exists(baseNames))
+        )
+    }
+  }
+
+  private def bfsSeedSymbols(
+      path: AbsolutePath
+  ): Seq[String] = {
+    documents.get(path).toSeq.flatMap { doc =>
+      doc.symbols.collect {
+        case sym
+            if isBfsSeedKind(sym.getKind()) &&
+              Symbol(sym.getSymbol()).isToplevel =>
+          sym.getSymbol()
+      }
+    }
+  }
+
+  private def isBfsSeedKind(
+      kind: Semanticdb.SymbolInformation.Kind
+  ): Boolean = {
+    kind == Semanticdb.SymbolInformation.Kind.TRAIT ||
+    kind == Semanticdb.SymbolInformation.Kind.INTERFACE ||
+    kind == Semanticdb.SymbolInformation.Kind.CLASS
+  }
+
+  /**
+   * Turbine-backed class information for Java types declared in `path`.
+   * Empty for non-Java files, files that are not in the index, or classes
+   * that have not been header-compiled yet.
+   *
+   * Returned [[PcSymbolInformation]] uses SemanticDB symbol strings for
+   * `annotations`, including both class-level and method-level annotations
+   * (e.g. `org/junit/Test#`).
+   */
+  def classInfo(path: AbsolutePath): Seq[PcSymbolInformation] = {
+    if (!path.isJava) {
+      scribe.warn(s"mbt-v2: classInfo not supported for non-Java files: $path")
+      Nil
+    } else {
+      documents.get(path) match {
+        case None =>
+          scribe.warn(s"mbt-v2: classInfo not found in index: $path")
+          Nil
+        case Some(doc) =>
+          val result = turbineCompiler.result
+          doc.symbols.flatMap { symbolInfo =>
+            if (!isClassLikeKind(symbolInfo.getKind())) Nil
+            else {
+              val symbol = symbolInfo.getSymbol()
+              try {
+                result
+                  .boundClass(Symbol(symbol).binaryName)
+                  .map { bound =>
+                    TurbineSymbolInfo.fromBoundClass(symbol, bound)
+                  }
+                  .toSeq
+              } catch {
+                case NonFatal(e) =>
+                  scribe.debug(
+                    s"turbine classInfo failed for $symbol in $path: ${e.getMessage}"
+                  )
+                  Nil
+              }
+            }
+          }.toSeq
+      }
+    }
+  }
+
+  private def isClassLikeKind(
+      kind: Semanticdb.SymbolInformation.Kind
+  ): Boolean =
+    kind == Semanticdb.SymbolInformation.Kind.CLASS ||
+      kind == Semanticdb.SymbolInformation.Kind.INTERFACE ||
+      kind == Semanticdb.SymbolInformation.Kind.OBJECT ||
+      kind == Semanticdb.SymbolInformation.Kind.TRAIT
 
   /**
    * Extracts potential test class candidates from the MBT index without loading semanticdb.
@@ -874,8 +967,10 @@ class MbtWorkspaceSymbolProvider(
         queries += s"${sym.displayName}():"
       } else if (sym.isType) {
         queries += s"${sym.displayName}:"
-        // this is needed for now because the Scala top-level mtags indexer does not emit ':'
-        queries += s"${sym.displayName}#"
+        // Top-level Scala and Java `extends` clauses emit ':', but anonymous
+        // and local Scala classes don't, so match any type reference too.
+        if (!params.toplevelImplementationsOnly)
+          queries += s"${sym.displayName}#"
       } else if (sym.isTerm) {
         queries += s"${sym.displayName}."
         // Scala vals and vars can be implemented via getters and setters
@@ -901,25 +996,27 @@ class MbtWorkspaceSymbolProvider(
         }
       }
     }
-    val fingerprints =
-      queries.iterator.map(FingerprintedCharSequence.fuzzyReference).toBuffer
-    val result = TrieMap.empty[AbsolutePath, Unit]
-    for {
-      path <- documentsKeys.toList
-      doc <- documents.get(path).toList.iterator
-      if fingerprints.exists(query => doc.bloomFilter.mightContain(query))
-    } {
-      if (doc.bloomFilter.isFull) {
-        scribe.warn(s"mbt-v2: bloom filter is full for ${path}")
-      }
-      if (path.exists) {
+    if (queries.isEmpty) {
+      Set.empty
+    } else {
+      // Precompute hashes once. `mightContain(CharSequence)` re-hashes the query
+      // for every document; WorkspaceSymbolQuery does the same precompute.
+      val hasher = StringBloomFilter.forEstimatedSize(0)
+      val hashes = queries.iterator.map { query =>
+        hasher.computeHashCode(FingerprintedCharSequence.fuzzyReference(query))
+      }.toArray
+      val result = TrieMap.empty[AbsolutePath, Unit]
+      // Iterate `documentsKeys` as a ParArray. `.toList` forced a sequential
+      // copy of the whole index on every call.
+      for {
+        path <- documentsKeys
+        doc <- documents.get(path).toList.iterator
+        if hashes.exists(doc.bloomFilter.mightContain)
+      } {
         result(path) = ()
-      } else {
-        // Clean up removed files
-        documents.remove(path)
       }
+      result.keysIterator.toSet
     }
-    result.keysIterator.toSet
   }
 
   // Convenience method to avoid dealing with the visitor-based query API
@@ -940,7 +1037,7 @@ class MbtWorkspaceSymbolProvider(
       params: MbtWorkspaceSymbolSearchParams,
       visitor: SymbolSearchVisitor,
   ): SymbolSearch.Result = {
-    if (!config().isMBT) {
+    if (!userConfig().workspaceSymbolProvider.isMBT) {
       scribe.warn(
         s"mbt-v2: config is not mbt-v2, skipping workspace symbol search"
       )
@@ -1028,7 +1125,7 @@ class MbtWorkspaceSymbolProvider(
       if (
         updateDocumentKeys &&
         doc.language.isJava &&
-        javaSymbolLoader().isTurbineClasspath
+        userConfig().javaSymbolLoader.isTurbineClasspath
       ) {
         doc.semanticdbPackages.headOption match {
           case Some(pkg) =>
@@ -1044,7 +1141,7 @@ class MbtWorkspaceSymbolProvider(
       } else if (
         updateDocumentKeys &&
         doc.language.isProtobuf &&
-        javaSymbolLoader().isTurbineClasspath
+        userConfig().javaSymbolLoader.isTurbineClasspath
       ) {
         // Covers proto files changed outside the editor (e.g. git checkout);
         // for editor saves, didSave already invalidated before the outline

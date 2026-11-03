@@ -15,6 +15,7 @@ import scala.meta.internal.bsp.BspConfigGenerationStatus.BspConfigGenerationStat
 import scala.meta.internal.metals.MetalsEnrichments._
 import scala.meta.internal.metals._
 import scala.meta.internal.metals.clients.language.ConfiguredLanguageClient
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.semver.SemVer
 import scala.meta.internal.semver.SemVer.isCompatibleVersion
 import scala.meta.io.AbsolutePath
@@ -334,21 +335,18 @@ object SbtBuildTool {
     val mainMeta = projectRoot.resolve("project")
     val metaMeta = projectRoot.resolve("project").resolve("project")
 
+    val writtenPlugin =
+      writePlugins(mainMeta, metalsPluginDetails, debugAdapterPluginDetails)
     val isSbt2 =
-      SbtBuildTool.loadVersion(projectRoot).exists(_.startsWith("2."))
+      SbtBuildTool.loadVersion(projectRoot).exists(ScalaVersions.isSbt2Version)
     if (isSbt2) {
-      val writtenPlugin = writePlugins(mainMeta, metalsPluginDetails)
       val writtenMeta = writePlugins(
         metaMeta,
         metalsPluginDetails,
+        // sbt 2.x doesn't need sbt-jdi-tools plugin because it only runs on Java 17+ where the JDI tools are included.
       )
       writtenMeta || writtenPlugin
     } else {
-      val writtenPlugin = writePlugins(
-        mainMeta,
-        metalsPluginDetails,
-        debugAdapterPluginDetails,
-      )
       val writtenMeta =
         writePlugins(metaMeta, metalsPluginDetails, jdiToolsPluginDetails)
       writtenMeta || writtenPlugin
@@ -470,6 +468,22 @@ object SbtBuildTool {
     }
   }
 
+  /** `sbt.version` from the nearest `project/build.properties` above `sbtFile`. */
+  def loadVersionForPath(sbtFile: AbsolutePath): Option[String] = {
+    @tailrec
+    def loop(dir: AbsolutePath): Option[String] = {
+      loadVersion(dir) match {
+        case some @ Some(_) => some
+        case None =>
+          dir.parentOpt match {
+            case Some(parent) => loop(parent)
+            case None => None
+          }
+      }
+    }
+    loop(sbtFile.parent)
+  }
+
   def sbtInputPosAdjustment(
       originInput: Input.VirtualFile,
       autoImports: Seq[String],
@@ -486,8 +500,10 @@ object SbtBuildTool {
       position.getCharacter(),
     )
     val adjustLspData = AdjustedLspData.create(
-      pos => {
-        new Position(pos.getLine() - appendLineSize, pos.getCharacter())
+      {
+        case (line, column) => {
+          (line - appendLineSize, column)
+        }
       },
       filterOutLocations = { loc => !loc.getUri().isSbt },
     )

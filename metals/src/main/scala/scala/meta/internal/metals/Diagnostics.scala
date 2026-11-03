@@ -13,6 +13,7 @@ import scala.meta.internal.metals.JsonParser._
 import scala.meta.internal.metals.MetalsEnrichments._
 import scala.meta.internal.metals.PositionSyntax._
 import scala.meta.internal.metals.ScalacDiagnostic.DiagnosticData
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.parsing.TokenEditDistance
 import scala.meta.io.AbsolutePath
 
@@ -61,6 +62,8 @@ final class Diagnostics(
     TrieMap.empty[AbsolutePath, Diagnostic]
   private val scalafixDiagnostics =
     TrieMap.empty[AbsolutePath, List[Diagnostic]]
+  private val pcDiagnostics =
+    TrieMap.empty[AbsolutePath, List[Diagnostic]]
   private val snapshots =
     TrieMap.empty[AbsolutePath, Input.VirtualFile]
   private val lastPublished =
@@ -86,9 +89,11 @@ final class Diagnostics(
     }
 
   def reset(): Unit = {
-    val keys = diagnostics.keys ++ scalafixDiagnostics.keys
+    val keys =
+      diagnostics.keys ++ scalafixDiagnostics.keys ++ pcDiagnostics.keys
     diagnostics.clear()
     scalafixDiagnostics.clear()
+    pcDiagnostics.clear()
     keys.foreach { key => publishDiagnostics(key) }
   }
 
@@ -170,7 +175,8 @@ final class Diagnostics(
     } else syntaxError.remove(path).toList
 
     val hadScalafixDiags = scalafixDiagnostics.remove(path).isDefined
-    if (diags.nonEmpty || hadScalafixDiags) {
+    val hadPcDiags = pcDiagnostics.remove(path).isDefined
+    if (diags.nonEmpty || hadScalafixDiags || hadPcDiags) {
       publishDiagnostics(path)
     }
   }
@@ -179,6 +185,7 @@ final class Diagnostics(
     diagnostics.remove(path)
     syntaxError.remove(path)
     scalafixDiagnostics.remove(path)
+    pcDiagnostics.remove(path)
 
     languageClient.publishDiagnostics(
       new PublishDiagnosticsParams(
@@ -331,16 +338,13 @@ final class Diagnostics(
     syntaxError.contains(path)
 
   def hasDiagnosticError(path: AbsolutePath): Boolean = {
-    val fileDiagnostics = diagnostics
+    def isError(d: Diagnostic): Boolean =
+      d.getSeverity() == l.DiagnosticSeverity.Error
+    val hasBspError = diagnostics
       .get(path)
-
-    fileDiagnostics match {
-      case Some(diagnostics) =>
-        diagnostics.asScala.exists(
-          _.diagnostic.getSeverity() == l.DiagnosticSeverity.Error
-        )
-      case None => false
-    }
+      .exists(_.asScala.exists(d => isError(d.diagnostic)))
+    val hasPcError = pcDiagnostics.get(path).exists(_.exists(isError))
+    hasBspError || hasPcError
   }
 
   def getFileDiagnostics(path: AbsolutePath): List[Diagnostic] =
@@ -352,10 +356,15 @@ final class Diagnostics(
   ): Unit = {
     if (!path.isFile) return didDelete(path)
     val uri = path.toURI.toString
-    val all = new ju.ArrayList[Diagnostic](queue.size() + 1)
+    val pcDiags = pcDiagnostics.getOrElse(path, Nil)
+    val all = new ju.ArrayList[Diagnostic](queue.size() + pcDiags.size + 1)
+    for (d <- pcDiags) {
+      all.add(d)
+    }
     for {
       diagnostic <- queue.asScala
       freshDiagnostic <- toFreshDiagnostic(path, diagnostic.diagnostic)
+      if !overlapsPcDiagnostic(freshDiagnostic, pcDiags)
     } {
       all.add(freshDiagnostic)
     }
@@ -390,12 +399,26 @@ final class Diagnostics(
       ds: List[Diagnostic],
   ): Unit = {
     if (userConfig().presentationCompilerDiagnostics) {
-      languageClient.publishDiagnostics(
-        new PublishDiagnosticsParams(
-          path.toURI.toString,
-          ds.asJava,
-        )
-      )
+      // A compile started while the file was open can finish after didClose.
+      // Drop that result so a closed file, including a sourcepath dependency,
+      // does not get its errors published again.
+      if (!buffers.contains(path)) {
+        if (pcDiagnostics.remove(path).isDefined) publishDiagnostics(path)
+      } else {
+        if (ds.isEmpty) pcDiagnostics.remove(path)
+        else pcDiagnostics(path) = ds
+        publishDiagnostics(path)
+      }
+    }
+  }
+
+  private def overlapsPcDiagnostic(
+      diagnostic: Diagnostic,
+      pcDiags: List[Diagnostic],
+  ): Boolean = {
+    pcDiags.exists { pc =>
+      pc.getSeverity == diagnostic.getSeverity &&
+      pc.getRange.overlapsWith(diagnostic.getRange)
     }
   }
 

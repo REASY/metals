@@ -16,7 +16,7 @@ import scala.meta.internal.metals.JdkSources
 import scala.meta.internal.metals.MutableCancelable
 import scala.meta.internal.metals.Time
 import scala.meta.internal.metals.Timer
-import scala.meta.internal.metals.UserConfiguration
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.process.ExitCodes
 import scala.meta.internal.process.ProcessOutput
 import scala.meta.internal.process.SystemProcess
@@ -33,6 +33,9 @@ class ShellRunner(
 ) extends Cancelable {
 
   private val cancelables = new MutableCancelable()
+
+  private def shellQuote(arg: String): String =
+    "'" + arg.replace("'", "'\\''") + "'"
 
   override def cancel(): Unit = {
     cancelables.cancel()
@@ -96,7 +99,8 @@ class ShellRunner(
 
     val shellArguments = userConfiguration().defaultShell match {
       case Some(shell) if shell.contains("fish") => shell :: args
-      case Some(shell) => List(shell, "-i", "-l", "-c", args.mkString(" "))
+      case Some(shell) =>
+        List(shell, "-i", "-l", "-c", args.map(shellQuote).mkString(" "))
       case None => args
     }
     scribe.info(s"Running command: ${shellArguments.mkString(" ")}")

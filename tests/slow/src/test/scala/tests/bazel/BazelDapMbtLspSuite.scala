@@ -6,22 +6,26 @@ import scala.concurrent.Future
 import scala.concurrent.duration._
 
 import scala.meta.internal.builds.ShellRunner
-import scala.meta.internal.metals.AutoImportBuildKind
-import scala.meta.internal.metals.Configs.JavaSymbolLoaderConfig
-import scala.meta.internal.metals.Configs.ReferenceProviderConfig
-import scala.meta.internal.metals.Configs.WorkspaceSymbolProviderConfig
 import scala.meta.internal.metals.DebugUnresolvedTestClassParams
 import scala.meta.internal.metals.JsonParser._
 import scala.meta.internal.metals.Messages
 import scala.meta.internal.metals.MetalsEnrichments._
-import scala.meta.internal.metals.UserConfiguration
+import scala.meta.internal.metals.ScalaTestSuiteSelection
+import scala.meta.internal.metals.ScalaTestSuites
+import scala.meta.internal.metals.config.AutoImportBuildKind
+import scala.meta.internal.metals.config.JavaSymbolLoaderConfig
+import scala.meta.internal.metals.config.ReferenceProviderConfig
+import scala.meta.internal.metals.config.UserConfiguration
+import scala.meta.internal.metals.config.WorkspaceSymbolProviderConfig
 import scala.meta.internal.metals.debug.DebugWorkspaceLayout
 import scala.meta.internal.metals.mbt.MbtBuildServer
+import scala.meta.internal.metals.testProvider.TestExplorerEvent
 import scala.meta.internal.metals.{BuildInfo => V}
 import scala.meta.io.AbsolutePath
 
 import ch.epfl.scala.bsp4j.DebugSessionParamsDataKind
 import ch.epfl.scala.bsp4j.ScalaMainClass
+import ch.epfl.scala.bsp4j.TestParamsDataKind
 import tests.BaseDapSuite
 import tests.BazelBuildLayout
 import tests.MbtTestInitializer
@@ -40,11 +44,11 @@ class BazelDapMbtLspSuite
       presentationCompilerDiagnostics = true,
       buildOnChange = false,
       buildOnFocus = false,
-      workspaceSymbolProvider = WorkspaceSymbolProviderConfig.mbt,
-      javaSymbolLoader = JavaSymbolLoaderConfig.turbineClasspath,
-      referenceProvider = ReferenceProviderConfig.mbt,
+      workspaceSymbolProvider = WorkspaceSymbolProviderConfig.MBT,
+      javaSymbolLoader = JavaSymbolLoaderConfig.TurbineClasspath,
+      referenceProvider = ReferenceProviderConfig.MBT,
       preferredBuildServer = Some(MbtBuildServer.name),
-      automaticImportBuild = AutoImportBuildKind.All,
+      autoImportBuilds = AutoImportBuildKind.All,
     )
 
   override def initializeGitRepo: Boolean = true
@@ -121,6 +125,94 @@ class BazelDapMbtLspSuite
       _ <- debugger.shutdown
       output <- debugger.allOutput
     } yield assertContains(output, "OK (1 test)")
+  }
+
+  test("bazel-mbt-scalatest-test-selection", maxRetry = 3) {
+    client.selectedServer = Messages.ChooseBuildServer.mbt
+    cleanWorkspace()
+
+    for {
+      _ <- initialize(
+        BazelBuildLayout(
+          scalatestSelectionLayout,
+          V.scala213,
+          bazelVersion,
+          List("org.scalatest:scalatest_2.13:3.2.19"),
+          includeScalatest = true,
+        ),
+        runAdditionalCommands = pinMaven,
+      )
+      _ <- server.headServer.connectionProvider.buildServerPromise.future
+      _ <- server.didOpen("test/FooSpec.scala")
+      _ <- awaitMbtTestClassDiscovery("test/FooSpec.scala")
+      // Confirms the candidate test class via semanticdb, which populates
+      // its test framework, that we need to know to run `bazel` with the right args
+      _ <- server.discoverTestSuites(
+        List("test/FooSpec.scala"),
+        uri = Some(server.toPath("test/FooSpec.scala").toURI.toString),
+      )
+      debugger <- server.startDebugging(
+        "//test",
+        TestParamsDataKind.SCALA_TEST_SUITES_SELECTION,
+        ScalaTestSuites(
+          List(
+            ScalaTestSuiteSelection("test.FooSpec", List("foo test").asJava)
+          ).asJava,
+          Nil.asJava,
+          Nil.asJava,
+          Nil.asJava,
+        ),
+      )
+      _ <- debugger.initialize
+      _ <- debugger.launch
+      _ <- debugger.configurationDone
+      _ <- debugger.shutdown
+      output <- debugger.allOutput
+    } yield {
+      assertContains(output, "foo test")
+      assert(!output.contains("bar test"), "unselected test must not have run")
+    }
+  }
+
+  test("bazel-mbt-scalatest-cross-namespace-fixture", maxRetry = 3) {
+    client.selectedServer = Messages.ChooseBuildServer.mbt
+    cleanWorkspace()
+
+    for {
+      _ <- initialize(
+        BazelBuildLayout(
+          crossFileFixtureLayout,
+          V.scala213,
+          bazelVersion,
+          List("org.scalatest:scalatest_2.13:3.2.19"),
+          includeScalatest = true,
+        ),
+        runAdditionalCommands = pinMaven,
+      )
+      _ <- server.headServer.connectionProvider.buildServerPromise.future
+      // Only the spec is opened here. `IndirectFixture` lives in a
+      // different file, whose semanticdb is never generated ahead of time.
+      // This reproduces the MBT bug where scalatest style inference couldn't
+      // follow inheritance across file boundaries.
+      _ <- server.didOpen("test/FooFixtureSpec.scala")
+      _ <- awaitMbtTestClassDiscovery("test/FooFixtureSpec.scala")
+      updates <- server.discoverTestSuites(
+        List("test/FooFixtureSpec.scala"),
+        uri = Some(server.toPath("test/FooFixtureSpec.scala").toURI.toString),
+      )
+    } yield {
+      val testCaseNames = for {
+        update <- updates
+        addTestCases <- update.events.asScala.collect {
+          case add: TestExplorerEvent.AddTestCases => add
+        }
+        testCase <- addTestCases.testCases.asScala
+      } yield testCase.name
+      assert(
+        testCaseNames.contains("A Foo should do foo test"),
+        s"expected test case not found, got: $testCaseNames",
+      )
+    }
   }
 
   test("bazel-mbt-test-breakpoint") {
@@ -333,6 +425,83 @@ class BazelDapMbtLspSuite
        |  @Test
        |  public void testAddition() {
        |    assertEquals(4, 2 + 2);
+       |  }
+       |}
+       |""".stripMargin
+
+  private def scalatestSelectionLayout: String =
+    """|/.bazelproject
+       |targets:
+       |    //...
+       |
+       |/test/BUILD
+       |load("@rules_scala//scala:scala.bzl", "scala_test")
+       |
+       |scala_test(
+       |    name = "FooSpec",
+       |    srcs = ["FooSpec.scala"],
+       |    deps = ["@maven//:org_scalatest_scalatest_2_13"],
+       |)
+       |
+       |/test/FooSpec.scala
+       |package test
+       |
+       |import org.scalatest.funsuite.AnyFunSuite
+       |
+       |class FooSpec extends AnyFunSuite {
+       |  test("foo test") { assert(true) }
+       |  test("bar test") { fail("bar test must not run") }
+       |}
+       |""".stripMargin
+
+  private def crossFileFixtureLayout: String =
+    """|/.bazelproject
+       |targets:
+       |    //...
+       |
+       |/fixture/BUILD
+       |load("@rules_scala//scala:scala.bzl", "scala_library")
+       |
+       |scala_library(
+       |    name = "indirect_fixture",
+       |    srcs = ["IndirectFixture.scala"],
+       |    visibility = ["//visibility:public"],
+       |    deps = ["@maven//:org_scalatest_scalatest_2_13"],
+       |)
+       |
+       |/fixture/IndirectFixture.scala
+       |package fixture
+       |
+       |import org.scalatest.Outcome
+       |import org.scalatest.wordspec.FixtureAnyWordSpecLike
+       |
+       |trait IndirectFixture extends FixtureAnyWordSpecLike {
+       |  type FixtureParam = Unit
+       |  override def withFixture(test: OneArgTest): Outcome = test(())
+       |}
+       |
+       |/test/BUILD
+       |load("@rules_scala//scala:scala.bzl", "scala_test")
+       |
+       |scala_test(
+       |    name = "FooFixtureSpec",
+       |    srcs = ["FooFixtureSpec.scala"],
+       |    deps = [
+       |        "//fixture:indirect_fixture",
+       |        "@maven//:org_scalatest_scalatest_2_13",
+       |    ],
+       |)
+       |
+       |/test/FooFixtureSpec.scala
+       |package test
+       |
+       |import fixture.IndirectFixture
+       |
+       |class FooFixtureSpec extends IndirectFixture {
+       |  "A Foo" should {
+       |    "do foo test" in { _ =>
+       |      assert(true)
+       |    }
        |  }
        |}
        |""".stripMargin

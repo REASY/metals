@@ -1,6 +1,5 @@
 package scala.meta.internal.metals
 
-import java.net.URI
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.time.Duration
@@ -15,6 +14,8 @@ import scala.concurrent.ExecutionContextExecutorService
 import scala.concurrent.Future
 import scala.concurrent.duration.DurationInt
 import scala.concurrent.duration.FiniteDuration
+import scala.util.Failure
+import scala.util.Success
 import scala.util.control.NonFatal
 import scala.{meta => m}
 
@@ -25,7 +26,6 @@ import scala.meta.inputs.Input
 import scala.meta.inputs.Position
 import scala.meta.internal
 import scala.meta.internal.async.CompletableCancelToken
-import scala.meta.internal.builds.SbtBuildTool
 import scala.meta.internal.metals.CompilerOffsetParamsUtils
 import scala.meta.internal.metals.CompilerRangeParamsUtils
 import scala.meta.internal.metals.Compilers.PresentationCompilerKey
@@ -34,7 +34,6 @@ import scala.meta.internal.metals.decompile.DecompileBytecode
 import scala.meta.internal.metals.mbt.MbtBuild
 import scala.meta.internal.metals.mbt.MbtWorkspaceSymbolProvider
 import scala.meta.internal.metals.mbt.ProtoGeneratedJavaFiles
-import scala.meta.internal.mtags.MD5
 import scala.meta.internal.mtags.Mtags
 import scala.meta.internal.parsing.Trees
 import scala.meta.internal.pc.LogMessages
@@ -99,7 +98,7 @@ class Compilers(
     workspace: AbsolutePath,
     config: ClientConfiguration,
     serverConfig: MetalsServerConfig,
-    userConfig: () => UserConfiguration,
+    userConfig: () => internal.metals.config.UserConfiguration,
     buildTargets: BuildTargets,
     buffers: Buffers,
     diagnostics: Diagnostics,
@@ -272,15 +271,9 @@ class Compilers(
                   lazyPc
                 } else {
                   presentationCompiler.shutdown()
-                  StandaloneCompiler(
+                  standaloneScalaCompiler(
                     scalaVersion,
-                    search,
                     fallbackClasspaths.scalaCompilerClasspath(),
-                    completionItemPriority(),
-                    fallbackPresentationCompilerSourcepathSupplier(
-                      scalaVersion
-                    ),
-                    serverConfig.compilers.sourcePathMode,
                   )
                 }
               }
@@ -292,13 +285,9 @@ class Compilers(
                   fallbackClasspaths.javaCompilerClasspath(),
                 )
               } else {
-                StandaloneCompiler(
+                standaloneScalaCompiler(
                   scalaVersion,
-                  search,
                   fallbackClasspaths.scalaCompilerClasspath(),
-                  completionItemPriority(),
-                  fallbackPresentationCompilerSourcepathSupplier(scalaVersion),
-                  serverConfig.compilers.sourcePathMode,
                 )
               }
           }
@@ -306,6 +295,74 @@ class Compilers(
       )
       .await
   }
+
+  // A fallback compiler differentiated by a scala version, if it's known (needed to
+  // get the matching classpath, since we filter it based on the scala version).
+  // Used for reuse/optimisation purposes.
+  private def fallbackCompilerForTarget(
+      path: AbsolutePath
+  ): PresentationCompiler = {
+    val fallbackBinaryVersion =
+      ScalaVersions.scalaBinaryVersionFromFullVersion(
+        scalaVersionSelector.fallbackScalaVersion()
+      )
+    val targetBinaryVersion =
+      if (path.isScalaFilename)
+        buildTargets
+          .inverseSources(path)
+          .flatMap(buildTargets.scalaTarget)
+          .map(_.scalaBinaryVersion)
+      else None
+    targetBinaryVersion match {
+      case Some(binaryVersion)
+          if binaryVersion != fallbackBinaryVersion &&
+            ScalaVersions.isSupportedScalaBinaryVersion(binaryVersion) =>
+        scalaFallbackCompiler(binaryVersion)
+      case _ => fallbackCompiler(path)
+    }
+  }
+
+  private def scalaFallbackCompiler(
+      scalaBinaryVersion: String
+  ): PresentationCompiler =
+    jcache
+      .compute(
+        PresentationCompilerKey.ScalaFallback(scalaBinaryVersion),
+        (_, value) => {
+          val scalaVersion =
+            scalaVersionSelector.fallbackScalaVersion(scalaBinaryVersion)
+          Option(value) match {
+            case Some(lazyPc) if lazyPc.await.scalaVersion() == scalaVersion =>
+              lazyPc
+            case existing =>
+              existing.foreach(_.await.shutdown())
+              standaloneScalaCompiler(
+                scalaVersion,
+                fallbackClasspaths.scalaCompilerClasspath(scalaBinaryVersion),
+              )
+          }
+        },
+      )
+      .await
+
+  private def standaloneScalaCompiler(
+      scalaVersion: String,
+      classpath: Seq[Path],
+  ): MtagsPresentationCompiler =
+    StandaloneCompiler(
+      scalaVersion,
+      search,
+      classpath,
+      completionItemPriority(),
+      fallbackPresentationCompilerSourcepathSupplier(scalaVersion),
+      serverConfig.compilers.sourcePathMode,
+    )
+
+  private def fallbackCompilerKeys: Iterable[PresentationCompilerKey] =
+    cache.keys.collect {
+      case key: PresentationCompilerKey.Default => key
+      case key: PresentationCompilerKey.ScalaFallback => key
+    }
 
   def loadedPresentationCompilerCount(): Int =
     cache.values.count(_.await.isLoaded())
@@ -350,44 +407,52 @@ class Compilers(
     }
 
   def didClose(path: AbsolutePath): Unit = {
+    inFlightDidChange.remove(path).foreach(_.cancel())
     loadCompiler(path).foreach(_.didClose(path.toNIO.toUri()))
   }
 
-  def didFocus(path: AbsolutePath): Future[List[Diagnostic]] = {
+  def didFocus(path: AbsolutePath): Future[Option[List[Diagnostic]]] = {
     val maybeDiagnostics =
-      for (pc <- loadCompiler(path); contents <- buffers.get(path))
+      for (pc <- loadCompiler(path))
         yield {
+          val token = new CompletableCancelToken()
+          inFlightDidChange.put(path, token).foreach(_.cancel())
           timerProvider
             .withTimer(
               s"[${pc.buildTargetId()}] computed diagnostics",
               reportStatus = false,
               onlyIf = serverConfig.statistics.isDiagnostics,
             ) {
-              pc.didChange(
-                CompilerVirtualFileParams(
-                  path.toNIO.toUri,
-                  contents,
-                  EmptyCancelToken,
-                  outlineFilesProvider.getOutlineFiles(pc.buildTargetId()),
-                  shouldReturnDiagnostics =
-                    userConfig().presentationCompilerDiagnostics,
-                )
-              ).asScala
-                .map { result =>
-                  result.asScala.toList
-                }
-            }
-            .map { case (timer, result) =>
-              metrics.recordEvent(
-                Event
-                  .duration("diagnostics", timer.elapsed)
-                  .withLanguage(path.toJLanguage)
+              didChangePc(
+                path,
+                shouldReturnDiagnostics =
+                  userConfig().presentationCompilerDiagnostics,
+                token,
               )
-              result
+            }
+            .transformWith {
+              case Success((timer, result)) =>
+                metrics.recordEvent(
+                  Event
+                    .duration("diagnostics", timer.elapsed)
+                    .withLanguage(path.toJLanguage)
+                )
+                if (token.isCancelled) Future.successful(None)
+                else {
+                  diagnostics.publishDiagnosticsNotAdjusted(path, result)
+                  Future.successful(Some(result))
+                }
+              case Failure(_) if token.isCancelled =>
+                Future.successful(None)
+              case Failure(error) =>
+                Future.failed(error)
             }
         }
 
-    maybeDiagnostics.getOrElse(Future.successful(List.empty))
+    maybeDiagnostics.getOrElse {
+      diagnostics.publishDiagnosticsNotAdjusted(path, Nil)
+      Future.successful(Some(Nil))
+    }
   }
 
   private val inFlightDidChange =
@@ -403,38 +468,37 @@ class Compilers(
           futures =
             for {
               file <- changedFiles.distinct
-              pc <- this.loadCompiler(file).toList
-              contents <- buffers.get(file).toList
             } yield {
               val token = new CompletableCancelToken()
               inFlightDidChange.put(file, token).foreach { old =>
                 old.cancel()
               }
-              val params = CompilerVirtualFileParams(
-                file.toNIO.toUri,
-                contents,
-                token = token,
-                shouldReturnDiagnostics =
-                  userConfig().presentationCompilerDiagnostics,
-              )
               timerProvider
                 .withTimer(
                   "computed diagnostics",
                   reportStatus = false,
                   onlyIf = false,
                 ) {
-                  pc.didChange(params).asScala
+                  didChangePc(file, token = token)
                 }
-                .map { case (timer, reportedDiagnostics) =>
-                  diagnostics.publishDiagnosticsNotAdjusted(
-                    file,
-                    reportedDiagnostics.asScala.toList,
-                  )
-                  metrics.recordEvent(
-                    Event
-                      .duration("diagnostics", timer.elapsed)
-                      .withLanguage(file.toJLanguage)
-                  )
+                .transformWith {
+                  case Success((timer, reportedDiagnostics)) =>
+                    metrics.recordEvent(
+                      Event
+                        .duration("diagnostics", timer.elapsed)
+                        .withLanguage(file.toJLanguage)
+                    )
+                    if (!token.isCancelled) {
+                      diagnostics.publishDiagnosticsNotAdjusted(
+                        file,
+                        reportedDiagnostics,
+                      )
+                    }
+                    Future.unit
+                  case Failure(_) if token.isCancelled =>
+                    Future.unit
+                  case Failure(error) =>
+                    Future.failed(error)
                 }
             }
           _ <- Future.sequence(futures)
@@ -481,16 +545,21 @@ class Compilers(
           additionalOptions = Seq("-explain"),
         )
 
-        val input = path.toInputFromBuffers(buffers)
-        val params = Compilers.DidChangeCompilerFileParams(
+        val (input, _, adjust) =
+          sourceMapper.pcMapping(path, scalaVersion)
+        val params = CompilerVirtualFileParams(
           path.toNIO.toUri(),
           input.value,
+          EmptyCancelToken,
+          outlineFilesProvider.getOutlineFiles(
+            Some(explainCompiler.buildTargetId)
+          ),
           shouldReturnDiagnostics = true,
         )
         explainCompiler.await
           .didChange(params)
           .asScala
-          .map(_.asScala.toList)
+          .map(_.asScala.map(adjust.adjustDiagnostic).toList)
           .andThen { case _ =>
             // Clean up the temporary compiler
             explainCompiler.shutdown()
@@ -501,33 +570,15 @@ class Compilers(
     }
   }
 
-  private def didChangeBSPDiagnostics(
+  private def didChangePc(
       path: AbsolutePath,
-      shouldReturnDiagnostics: Boolean,
-      content: Option[String] = None,
+      shouldReturnDiagnostics: Boolean = false,
+      token: CancelToken = EmptyCancelToken,
   ): Future[List[Diagnostic]] = {
-    def originInput =
-      content.map(Input.VirtualFile(path.toURI.toString(), _)).getOrElse {
-        path.toInputFromBuffers(buffers)
-      }
-
     loadCompiler(path)
       .map { pc =>
-        val inputAndAdjust =
-          if (
-            path.isWorksheet && ScalaVersions.isScala3Version(
-              pc.scalaVersion()
-            )
-          ) {
-            WorksheetProvider.worksheetScala3AdjustmentsForPC(originInput)
-          } else {
-            None
-          }
-
-        val (input, adjust) = inputAndAdjust.getOrElse(
-          originInput,
-          AdjustedLspData.default,
-        )
+        val (input, _, adjust) =
+          sourceMapper.pcMapping(path, pc.scalaVersion())
 
         outlineFilesProvider.didChange(pc.buildTargetId(), path)
 
@@ -535,10 +586,13 @@ class Compilers(
           ds <-
             pc
               .didChange(
-                Compilers.DidChangeCompilerFileParams(
-                  path.toNIO.toUri(),
+                CompilerVirtualFileParams(
+                  path.toNIO.toUri,
                   input.value,
-                  shouldReturnDiagnostics,
+                  token,
+                  outlineFilesProvider.getOutlineFiles(pc.buildTargetId()),
+                  shouldReturnDiagnostics =
+                    shouldReturnDiagnostics || userConfig().presentationCompilerDiagnostics,
                 )
               )
               .asScala
@@ -555,14 +609,13 @@ class Compilers(
       // Batch/debounce these requests since they can arrive in bursts
       fileDidChange(Seq(path))
     else
-      didChangeBSPDiagnostics(path, shouldReturnDiagnostics = false).ignoreValue
+      didChangePc(path, shouldReturnDiagnostics = false).ignoreValue
   }
 
   def didChangeWithDiagnostics(
-      path: AbsolutePath,
-      content: Option[String] = None,
+      path: AbsolutePath
   ): Future[List[Diagnostic]] = {
-    didChangeBSPDiagnostics(path, shouldReturnDiagnostics = true, content)
+    didChangePc(path, shouldReturnDiagnostics = true)
   }
 
   def didCompile(report: CompileReport): Unit = {
@@ -602,24 +655,17 @@ class Compilers(
 
   def clearFallbackCompilerCache(): Unit = {
     for {
-      language <- List(s.Language.SCALA, s.Language.JAVA)
-    } yield {
-      val default = Option(
-        jcache.get(PresentationCompilerKey.Default(language))
-      )
-      default.foreach { pc =>
-        pc.await.shutdown()
-        jcache.remove(PresentationCompilerKey.Default(language))
-      }
+      key <- fallbackCompilerKeys.toList
+      pc <- Option(jcache.remove(key))
+    } {
+      pc.await.shutdown()
     }
   }
 
   def restartFallbackCompilers(): Unit = {
     for {
-      language <- List(s.Language.SCALA, s.Language.JAVA)
-      compiler <- Option(
-        jcache.get(PresentationCompilerKey.Default(language))
-      )
+      key <- fallbackCompilerKeys.toList
+      compiler <- Option(jcache.get(key))
     } {
       compiler.await.restart()
     }
@@ -801,7 +847,7 @@ class Compilers(
   ): Future[SemanticTokens] = {
     val path = params.getTextDocument.getUri.toAbsolutePath
     val emptyTokens = ju.Collections.emptyList[Integer]();
-    if (!userConfig().enableSemanticHighlighting || path.isTwirlTemplate) {
+    if (path.isTwirlTemplate) {
       Future { new SemanticTokens(emptyTokens) }
     } else {
       loadCompiler(path)
@@ -898,11 +944,13 @@ class Compilers(
         inlayHints.asScala
           .dropWhile { hint =>
             val adjusted =
-              adjust.adjustPos(hint.getPosition(), adjustToZero = false)
+              adjust.adjustPosition(hint.getPosition())
             adjusted.getLine() < 0 || adjusted.getCharacter() < 0
           }
           .map { hint =>
-            hint.setPosition(adjust.adjustPos(hint.getPosition()))
+            hint.setPosition(
+              adjust.adjustPosition(hint.getPosition(), adjustToZero = false)
+            )
             InlayHintCompat.maybeFixInlayHintData(
               hint,
               params.getTextDocument().getUri(),
@@ -917,7 +965,7 @@ class Compilers(
           token,
           outlineFilesProvider.getOutlineFiles(pc.buildTargetId()),
         )
-      val options = userConfig().inlayHintsOptions
+      val options = userConfig().inlayHints
       val pcParams = CompilerInlayHintsParams(
         rangeParams,
         inferredTypes = options.inferredType,
@@ -1195,10 +1243,10 @@ class Compilers(
   ): Future[List[ReferencesResult]] = {
     val filteredFiles = searchFiles.filter(_.isScalaOrJava)
     val results =
-      if (symbols.isEmpty || filteredFiles.isEmpty) Nil
+      if (symbols.isEmpty || filteredFiles.isEmpty) Future.successful(Nil)
       else
         withUncachedCompilers(id) { case (scalaCompiler, javaCompiler) =>
-          for {
+          val references = for {
             searchFile <- filteredFiles
             if !isCancelled()
           } yield {
@@ -1228,12 +1276,11 @@ class Compilers(
                   .toList
               )
           }
+          Future.sequence(references).map(_.flatten)
         }
-          .getOrElse(Nil)
+          .map(_.getOrElse(Nil))
 
-    Future
-      .sequence(results)
-      .map(_.flatten)
+    results
       .map { res =>
         scribe.debug(
           s"PC references found: ${res.size}: ${res.mkString("\n")}"
@@ -1795,7 +1842,7 @@ class Compilers(
   private def loadJavaCompiler(
       targetId: BuildTargetIdentifier
   ): Option[PresentationCompiler] = {
-    buildTargets.jvmTarget(targetId).map { javaTarget =>
+    buildTargets.jvmTarget(targetId, scalaPreferred = false).map { javaTarget =>
       jcache
         .computeIfAbsent(
           PresentationCompilerKey.JavaBuildTarget(targetId),
@@ -1822,7 +1869,7 @@ class Compilers(
     ).withConfiguration(
       config.initialConfig.compilers.copy(
         emitDiagnostics = true,
-        protobufLspConfig = userConfig().protobufLspConfig,
+        protobufLspEnabled = userConfig().protobufLspEnabled,
       )
     )
   }
@@ -1844,11 +1891,9 @@ class Compilers(
           buffers.open.filter(buf => sources.exists(buf.startWith)).toList
 
         modifiedFiles.foreach(path =>
-          pc.didChange(
-            CompilerVirtualFileParams(
-              path.toNIO.toUri,
-              buffers.get(path).get,
-            )
+          didChangePc(
+            path,
+            shouldReturnDiagnostics = false,
           )
         )
         pc
@@ -1897,8 +1942,10 @@ class Compilers(
 
   private def withUncachedCompilers[T](
       targetId: BuildTargetIdentifier
-  )(f: (PresentationCompiler, PresentationCompiler) => T): Option[T] =
-    withKeyAndDefault(targetId) { case (key, getCompiler) =>
+  )(
+      f: (PresentationCompiler, PresentationCompiler) => Future[T]
+  ): Future[Option[T]] = {
+    val result = withKeyAndDefault(targetId) { case (key, getCompiler) =>
       val javaCompiler = loadJavaCompiler(targetId)
       val (out, shouldShutdown) = Option(jcache.get(key))
         .map((_, false))
@@ -1912,11 +1959,24 @@ class Compilers(
         }
       }
       if (shouldShutdown) {
-        compiler.foreach(_.shutdown())
-        javaCompiler.foreach(_.shutdown())
+        result match {
+          case Some(future) =>
+            future.onComplete { _ =>
+              compiler.foreach(_.shutdown())
+              javaCompiler.foreach(_.shutdown())
+            }
+          case None =>
+            compiler.foreach(_.shutdown())
+            javaCompiler.foreach(_.shutdown())
+        }
       }
       result
     }
+    result match {
+      case Some(future) => future.map(Some(_))
+      case None => Future.successful(None)
+    }
+  }
 
   private def withPCAndAdjustLsp[T](
       params: SelectionRangeParams
@@ -2183,7 +2243,7 @@ class Compilers(
   ): Future[s.TextDocuments] = {
     def getCompiler(path: AbsolutePath): Option[PresentationCompiler] =
       if (useFallbackCompiler && path.isScalaOrJava)
-        Some(fallbackCompiler(path))
+        Some(fallbackCompilerForTarget(path))
       else
         loadCompiler(path)
 
@@ -2192,25 +2252,59 @@ class Compilers(
         .flatMap(s => getCompiler(s).map(pc => (pc, s)))
         .groupBy(_._1)
     } yield {
-      val params = paths.map { case (_, s) =>
-        CompilerVirtualFileParams(
-          s.toURI,
-          s.toInputFromBuffers(buffers).text,
-          token = cancelToken,
-          shouldReturnDiagnostics = true,
-          shouldPruneSemanticdb = shouldPruneSemanticdb,
-        ): VirtualFileParams
-      }
+      val params: Seq[(VirtualFileParams, AdjustLspData, AbsolutePath)] =
+        paths.map { case (_, path) =>
+
+          val (input, _, adjust) =
+            sourceMapper.pcMapping(path, pc.scalaVersion())
+          val params = CompilerVirtualFileParams(
+            path.toURI,
+            input.value,
+            token = cancelToken,
+            shouldReturnDiagnostics = true,
+            shouldPruneSemanticdb = shouldPruneSemanticdb,
+          )
+          (params: VirtualFileParams, adjust, path)
+        }
+
       if (pc.supportsBatchSemanticdbTextDocuments()) {
-        pc.batchSemanticdbTextDocuments(params.asJava, timeout)
+        val mapping = params.flatMap {
+          // noop for normal files
+          case (_, DefaultAdjustedData, _) =>
+            None
+          case (param, adjust, path) =>
+            Some(
+              param.uri.toString() -> (
+                adjust,
+                path.toInputFromBuffers(buffers).value,
+              )
+            )
+        }.toMap
+
+        pc.batchSemanticdbTextDocuments(params.map(_._1).asJava, timeout)
           .asScala
-          .map(bytes => s.TextDocuments.parseFrom(bytes).documents)
+          .map(bytes =>
+            s.TextDocuments.parseFrom(bytes).documents.map { case doc =>
+              mapping
+                .get(doc.uri.toString())
+                .map { case (adjust, originalText) =>
+                  adjust.adjustTextDocument(doc, originalText)
+                }
+                .getOrElse(doc)
+            }
+          )
       } else {
         val all = for {
-          param <- params
+          (param, adjust, path) <- params
           doc = pc.semanticdbTextDocument(param)
-        } yield doc.asScala
-        Future.sequence(all).map { docs =>
+        } yield doc.asScala.map { d =>
+          val textDoc = s.TextDocument.parseFrom(d)
+          adjust.adjustTextDocument(
+            textDoc,
+            path.toInputFromBuffers(buffers).value,
+          )
+        }
+        Future.sequence(all).map { parsedDocs =>
           val targetRoot = buildTargets
             .jvmTarget(
               new BuildTargetIdentifier(pc.buildTargetId())
@@ -2218,7 +2312,6 @@ class Compilers(
             .flatMap(_.getTargetroot)
             .getOrElse(workspace)
 
-          val parsedDocs = docs.map(d => s.TextDocument.parseFrom(d))
           parsedDocs
             .map { d =>
               if (d.uri.startsWith("file:") || d.uri.startsWith("jar:"))
@@ -2242,23 +2335,14 @@ class Compilers(
   ): s.TextDocument = {
     val pc = loadCompiler(source).getOrElse(fallbackCompiler(source))
 
-    val (prependedLinesSize, modifiedText) =
-      Option
-        .when(source.isSbt)(
-          buildTargets
-            .sbtAutoImports(source)
-        )
-        .flatten
-        .fold((0, text))(imports =>
-          (imports.size, SbtBuildTool.prependAutoImports(text, imports))
-        )
+    val (input, _, adjust) = sourceMapper.pcMapping(source, pc.scalaVersion())
 
     // NOTE(olafur): it's unfortunate that we block on `semanticdbTextDocument`
     // here but to avoid it we would need to refactor the `Semanticdbs` trait,
     // which requires more effort than it's worth.
     val params = new CompilerVirtualFileParams(
       source.toURI,
-      modifiedText,
+      input.value,
       token = EmptyCancelToken,
       outlineFiles = outlineFilesProvider.getOutlineFiles(pc.buildTargetId()),
     )
@@ -2268,65 +2352,15 @@ class Compilers(
         config.initialConfig.compilers.timeoutDelay,
         config.initialConfig.compilers.timeoutUnit,
       )
+
     val textDocument = {
       val doc = s.TextDocument.parseFrom(bytes)
       if (doc.text.isEmpty()) doc.withText(text)
       else doc
     }
-    if (prependedLinesSize > 0)
-      cleanupAutoImports(textDocument, text, prependedLinesSize)
-    else textDocument
-  }
-
-  private def cleanupAutoImports(
-      document: s.TextDocument,
-      originalText: String,
-      linesSize: Int,
-  ): s.TextDocument = {
-
-    def adjustRange(range: s.Range): Option[s.Range] = {
-      val nextStartLine = range.startLine - linesSize
-      val nextEndLine = range.endLine - linesSize
-      if (nextEndLine >= 0) {
-        val nextRange = range.copy(
-          startLine = nextStartLine,
-          endLine = nextEndLine,
-        )
-        Some(nextRange)
-      } else None
-    }
-
-    val adjustedOccurences =
-      document.occurrences.flatMap { occurence =>
-        occurence.range
-          .flatMap(adjustRange)
-          .map(r => occurence.copy(range = Some(r)))
-      }
-
-    val adjustedDiagnostic =
-      document.diagnostics.flatMap { diagnostic =>
-        diagnostic.range
-          .flatMap(adjustRange)
-          .map(r => diagnostic.copy(range = Some(r)))
-      }
-
-    val adjustedSynthetic =
-      document.synthetics.flatMap { synthetic =>
-        synthetic.range
-          .flatMap(adjustRange)
-          .map(r => synthetic.copy(range = Some(r)))
-      }
-
-    s.TextDocument(
-      schema = document.schema,
-      uri = document.uri,
-      text = originalText,
-      md5 = MD5.compute(originalText),
-      language = document.language,
-      symbols = document.symbols,
-      occurrences = adjustedOccurences,
-      diagnostics = adjustedDiagnostic,
-      synthetics = adjustedSynthetic,
+    adjust.adjustTextDocument(
+      textDocument,
+      text,
     )
   }
 
@@ -2349,16 +2383,7 @@ object Compilers {
         extends PresentationCompilerKey
     final case class Default(language: s.Language)
         extends PresentationCompilerKey
+    final case class ScalaFallback(scalaBinaryVersion: String)
+        extends PresentationCompilerKey
   }
-
-  // To be removed in the future after:
-  // - https://github.com/scalameta/metals/pull/7430
-  // - https://github.com/scala/scala3/pull/22259
-  case class DidChangeCompilerFileParams(
-      uri: URI,
-      text: String,
-      override val shouldReturnDiagnostics: Boolean,
-      token: CancelToken = EmptyCancelToken,
-  ) extends VirtualFileParams
-
 }

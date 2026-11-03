@@ -40,6 +40,7 @@ import scala.meta.internal.metals.codelenses.GotoTestCodeLens
 import scala.meta.internal.metals.codelenses.RunTestCodeLens
 import scala.meta.internal.metals.codelenses.SuperMethodCodeLens
 import scala.meta.internal.metals.codelenses.WorksheetCodeLens
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.metals.debug.BuildTargetClasses
 import scala.meta.internal.metals.debug.BuildTargetClassesFinder
 import scala.meta.internal.metals.debug.DebugDiscovery
@@ -230,7 +231,16 @@ abstract class MetalsLspService(
       definitionIndex,
       () => Some(mbtSymbolSearch),
       workDoneProgress,
+      shouldDiscoverMbtClasses = () => discoverMbtClassesFromIndex,
     )
+
+  /**
+   * Whether MBT should discover main/test classes from the symbol index.
+   * Bazel already declares them in `mbt.json`; Maven, Gradle, and scripts
+   * still need index discovery until those importers populate the same fields.
+   * Mixed workspaces that also contain Bazel must keep discovery enabled.
+   */
+  protected def discoverMbtClassesFromIndex: Boolean = true
 
   val scalaVersionSelector = new ScalaVersionSelector(
     () => userConfig,
@@ -263,6 +273,7 @@ abstract class MetalsLspService(
     clientConfig.initialConfig.enableBestEffort,
   )
   var indexingPromise: Promise[Unit] = Promise[Unit]()
+  val initialBuildTargetsReady: Promise[Unit] = Promise[Unit]()
   def workspaceSymbolIndexingPromise: Promise[Unit] = {
     if (userConfig.workspaceSymbolProvider.isMBT) {
       // Don't block on BSP indexing when mbt is enabled.
@@ -347,22 +358,18 @@ abstract class MetalsLspService(
   private val sleeper: Sleeper =
     new Sleeper.ScheduledExecutorServiceSleeper(sh)
 
-  private val mbt2 = new MbtWorkspaceSymbolProvider(
+  protected val mbt2 = new MbtWorkspaceSymbolProvider(
     workspace = folder,
-    config = () => userConfig.workspaceSymbolProvider,
+    userConfig = () => userConfig,
     buffers = buffers,
     time = time,
     metrics = metrics,
     mtags = () => mtags,
     progress = workDoneProgress,
     onIndexingDone = restartFallbackCompilers,
-    javaSymbolLoader = () => userConfig.javaSymbolLoader,
     fallbackClasspaths = () => compilers.fallbackClasspaths,
     sleeper = sleeper,
-    turbineRecompileDelay = () => userConfig.javaTurbineRecompileDelay,
-    turbineCacheConfig = () => userConfig.javaTurbineCache,
     indexFilters = MbtIndexFilter.allFilters,
-    protobufLspConfig = () => userConfig.protobufLspConfig,
     metalsOutDir = Some(embedded.targetDir),
     mbtBuild = () => mbtBuild,
   )
@@ -395,9 +402,8 @@ abstract class MetalsLspService(
     scalaVersionSelector,
     saveDefFileToDisk = !clientConfig.isVirtualDocumentSupported(),
     sourceMapper,
-    () => userConfig.definitionProviders,
+    () => userConfig,
     mbt2,
-    () => userConfig.protobufLspConfig,
   )
 
   val stacktraceAnalyzer: StacktraceAnalyzer = new StacktraceAnalyzer(
@@ -421,6 +427,7 @@ abstract class MetalsLspService(
     getVisibleName,
     folder,
     workDoneProgress,
+    () => mbtReferenceProvider,
   )
 
   protected lazy val codeLensProvider: CodeLensProvider = {
@@ -624,6 +631,8 @@ abstract class MetalsLspService(
     scalaVersionSelector,
     clientConfig.icons(),
     clientConfig.isReadClipboardProvider(),
+    buildTargets,
+    trees,
     onCreate = path => {
       for {
         _ <- onCreate(path)
@@ -668,7 +677,7 @@ abstract class MetalsLspService(
     definitionProvider,
     symbolHierarchyOps,
     mbtSymbolSearch,
-    () => userConfig.protobufLspConfig,
+    () => userConfig,
   )
 
   protected val scalafixProvider: ScalafixProvider = ScalafixProvider(
@@ -928,14 +937,15 @@ abstract class MetalsLspService(
     focusedDocumentBuildTarget.set(
       buildTargets.inverseSources(path).getOrElse(null)
     )
-    buildTargets
+    val buildTargetClassesReady = buildTargets
       .inverseSources(path)
       .flatMap(buildTargets.activatePlatformForTarget)
-      .foreach { platform =>
+      .map { platform =>
         buildTargetClasses.rebuildIndex(
           buildTargets.targetsByPlatform(platform)
         )
       }
+      .getOrElse(Future.unit)
 
     // Update md5 fingerprint from file contents on disk
     fingerprints.add(path, FileIO.slurp(path, charset))
@@ -957,7 +967,6 @@ abstract class MetalsLspService(
       .foreach(languageClient.applyEdit)
 
     val parser = parseTrees(path)
-
     if (isDependencySource(path)) {
       Future
         .sequence(
@@ -974,12 +983,14 @@ abstract class MetalsLspService(
                 compilations.compileFile(path, assumeDidNotChange = true),
                 compilers.load(List(path)),
                 parser,
-                testProvider.didOpen(path),
+                buildTargetClassesReady.flatMap(_ => testProvider.didOpen(path)),
               )
             )
             .ignoreValue
         }
-        maybeImportFileAndLoad(path, load)
+        initialBuildTargetsReadyForDiagnostics.flatMap(_ =>
+          maybeImportFileAndLoad(path, load)
+        )
       }.asJava
     }
   }
@@ -1010,11 +1021,9 @@ abstract class MetalsLspService(
         Future.successful(DidFocusResult.NoBuildTarget)
       } else {
         for {
-          reportedDiagnostics <- compilers.didFocus(path)
-          _ = diagnostics.publishDiagnosticsNotAdjusted(
-            path,
-            reportedDiagnostics,
-          )
+          _ <- initialBuildTargetsReadyForDiagnostics
+          // Publishes unless a newer diagnostic request cancelled this one.
+          _ <- compilers.didFocus(path)
           result <-
             if (recentlyOpenedFiles.isRecentlyActive(path)) {
               Future.successful(DidFocusResult.RecentlyActive)
@@ -1029,9 +1038,19 @@ abstract class MetalsLspService(
 
   private def isDependencySource(path: AbsolutePath): Boolean =
     path.isDependencySource(folder) ||
-      !path.isWorkspaceSource(folder) ||
       buildTargets.isDependencySource(path) ||
       buildTargets.checkIfGeneratedSource(path.toNIO)
+
+  private def initialBuildTargetsReadyForDiagnostics: Future[Unit] =
+    if (
+      userConfig.workspaceSymbolProvider.isMBT &&
+      userConfig.javaSymbolLoader.isTurbineClasspath
+    ) {
+      buildServerPromise.future.flatMap { _ =>
+        if (bspSession.isDefined) initialBuildTargetsReady.future
+        else Future.unit
+      }
+    } else Future.unit
 
   def sync(
       uri: String,
@@ -1084,7 +1103,7 @@ abstract class MetalsLspService(
             .compileFile(path)
             .map(_ => DidFocusResult.Compiled)
         case Some(_) =>
-          Future.successful(DidFocusResult.AlreadyCompiled)
+          Future.successful(DidFocusResult.Compiled)
         case None =>
           Future.successful(DidFocusResult.NoBuildTarget)
       }
@@ -1166,11 +1185,7 @@ abstract class MetalsLspService(
     // rerun diagnostics for all open documents
     val futures =
       buffers.open.filter(isIncludedPath).map { path =>
-        for {
-          reportedDiagnostics <- compilers.didFocus(path)
-          _ = diagnostics
-            .publishDiagnosticsNotAdjusted(path, reportedDiagnostics)
-        } yield ()
+        compilers.didFocus(path).ignoreValue
       }
     Future.sequence(futures).map(_ => ())
   }
@@ -1182,7 +1197,9 @@ abstract class MetalsLspService(
 
   def restartFallbackCompilers(): Future[Unit] = {
     compilers.restartFallbackCompilers()
-    refreshDiagnostics(path => buildTargets.inverseSources(path).isEmpty)
+    initialBuildTargetsReadyForDiagnostics.flatMap(_ =>
+      refreshDiagnostics(path => buildTargets.inverseSources(path).isEmpty)
+    )
   }
 
   protected def didCompileTarget(report: CompileReport): Unit = {
@@ -1213,9 +1230,23 @@ abstract class MetalsLspService(
     if (bloopReportDelete.nonEmpty) connectionBspStatus.onReportsUpdate()
 
     val futures = List.newBuilder[Future[Unit]]
-    futures ++= otherDeleteEvents.map(event =>
-      onDelete(event.getUri().toAbsolutePath)
-    )
+    val deletions =
+      otherDeleteEvents.map(event => onDelete(event.getUri().toAbsolutePath))
+    futures ++= deletions
+    // A deleted .proto takes the types its outlines compiled to off CLASS_PATH,
+    // but the Java presentation compiler keeps the symbols it already resolved
+    // from those outlines and does not ask again until it restarts. The restart
+    // waits for the deletions, since one before them reads the outlines back.
+    if (otherDeleteEvents.exists(_.getUri().toAbsolutePath.isProtoFilename)) {
+      futures += Future
+        .sequence(deletions)
+        .flatMap { _ =>
+          compilers.restartJavaCompilers()
+          // A restarted compiler reports what the proto declares now only
+          // once it runs again, so run it rather than wait for the next edit.
+          refreshDiagnostics(_.isJavaFilename)
+        }
+    }
     val paths = changeAndCreateEvents.map(_.getUri().toAbsolutePath)
     futures += (paths.find(_.filename == "mbt.json") match {
       case Some(mbtJsonPath) =>
@@ -1234,6 +1265,7 @@ abstract class MetalsLspService(
     if (paths.exists(_.isProtoFilename)) {
       paths.filter(_.isProtoFilename).foreach(mbt2.didSave)
       compilers.restartJavaCompilers()
+      futures += refreshDiagnostics(_.isJavaFilename)
     }
     futures += onChange(paths)
     Future.sequence(futures.result()).ignoreValue
@@ -1408,7 +1440,15 @@ abstract class MetalsLspService(
   ): CompletableFuture[util.List[Location]] =
     CancelTokens.future { _ =>
       if (userConfig.referenceProvider.isMbt) {
-        mbtReferenceProvider.implementations(position).map(_.asJava)
+        mbtReferenceProvider.implementations(position).map { result =>
+          notifyIncompleteSearch(
+            result.isIncomplete,
+            result.processedCandidates,
+            result.totalCandidates,
+            "Implementations",
+          )
+          result.results.asJava
+        }
       } else {
         implementationProvider.implementations(position).map(_.asJava)
       }
@@ -1556,7 +1596,17 @@ abstract class MetalsLspService(
   ): CompletableFuture[util.List[Location]] =
     CancelTokens.future { _ =>
       if (userConfig.referenceProvider.isMbt) {
-        mbtReferenceProvider.references(params).map(getSortedLocations)
+        mbtReferenceProvider.references(params).map { results =>
+          results.find(_.isIncomplete).foreach { result =>
+            notifyIncompleteSearch(
+              result.isIncomplete,
+              result.processedCandidates,
+              result.totalCandidates,
+              "References",
+            )
+          }
+          getSortedLocations(results)
+        }
       } else {
         referencesProvider.references(params).map(getSortedLocations)
       }
@@ -1569,6 +1619,27 @@ abstract class MetalsLspService(
     SemanticdbTextDocumentsResult.fromSemanticdb(
       mbtReferenceProvider.textDocuments(paths)
     )
+  }
+
+  private def notifyIncompleteSearch(
+      isIncomplete: Boolean,
+      processed: Int,
+      total: Int,
+      kind: String,
+  ): Unit = {
+    if (isIncomplete) {
+      statusBar.addMessage(
+        Messages.ReferencesTimedOut.status(
+          clientConfig.icons(),
+          processed,
+          total,
+          kind,
+        )
+      )
+      languageClient.logMessage(
+        Messages.ReferencesTimedOut.logMessage(processed, total, kind)
+      )
+    }
   }
 
   private def getSortedLocations(referencesResult: List[ReferencesResult]) =
@@ -1658,7 +1729,15 @@ abstract class MetalsLspService(
       params: TypeHierarchySubtypesParams
   ): CompletableFuture[util.List[TypeHierarchyItem]] =
     CancelTokens.future { _ =>
-      typeHierarchyProvider.subtypes(params).map(_.asJava)
+      typeHierarchyProvider.subtypes(params).map { result =>
+        notifyIncompleteSearch(
+          result.isIncomplete,
+          result.processedCandidates,
+          result.totalCandidates,
+          "Subtypes",
+        )
+        result.results.asJava
+      }
     }
 
   override def completion(
@@ -2001,7 +2080,9 @@ abstract class MetalsLspService(
     HashBiMap.create()
 
   def bspTaskForTerminal(terminalId: String): Option[(String, String)] = {
-    Option(terminals.inverse().get(terminalId))
+    terminals.synchronized {
+      Option(terminals.inverse().get(terminalId))
+    }
   }
 
   val buildClient: ForwardingMetalsBuildClient =

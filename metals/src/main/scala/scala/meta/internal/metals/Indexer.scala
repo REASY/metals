@@ -19,6 +19,7 @@ import scala.meta.infra.Event
 import scala.meta.inputs.Input
 import scala.meta.internal.bsp.BspSession
 import scala.meta.internal.builds.WorkspaceReload
+import scala.meta.internal.metals.AdjustedLspData.LineColumn
 import scala.meta.internal.metals.Indexer.BackgroundJob
 import scala.meta.internal.metals.MetalsEnrichments._
 import scala.meta.internal.metals.SemanticdbDefinition
@@ -28,6 +29,7 @@ import scala.meta.internal.metals.mbt.OnDidChangeSymbolsParams
 import scala.meta.internal.mtags.DependencyModule
 import scala.meta.internal.mtags.IndexingResult
 import scala.meta.internal.mtags.MavenCoordinates
+import scala.meta.internal.mtags.MtagsIndexer
 import scala.meta.internal.semanticdb.Scala._
 import scala.meta.io.AbsolutePath
 import scala.meta.metals.MetalsLanguageServer
@@ -160,10 +162,6 @@ case class Indexer(indexProviders: IndexProviders, mbtBuild: () => MbtBuild)(
           data.addDependencyModules(build.asBspModules)
         }
 
-        // Fallback compilers can possibly use the jars from the build target data, so we trigger a restart
-        // here to pick up the newly indexed jar data.
-        indexProviders.restartFallbackCompilers()
-
         // For "wrapped sources", we create dedicated TargetData.MappedSource instances,
         // able to convert back and forth positions from the user-facing file to
         // the compiler-facing actual underlying source.
@@ -184,14 +182,6 @@ case class Indexer(indexProviders: IndexProviders, mbtBuild: () => MbtBuild)(
           data.addSourceItem(source, item.getTarget)
         }
       }
-    timerProvider.timedThunk(
-      "post update build targets stuff",
-      clientConfig.initialConfig.statistics.isIndex,
-      metricName = Some("index_workspace_post_update_build_targets"),
-    ) {
-      progress.message = "analyzing build targets"
-      check()
-    }
     timerProvider.timedThunk(
       "started file watcher",
       clientConfig.initialConfig.statistics.isIndex,
@@ -216,8 +206,36 @@ case class Indexer(indexProviders: IndexProviders, mbtBuild: () => MbtBuild)(
         metricName = Some("index_workspace_sources"),
       ) {
         progress.message = "indexing sources"
-        indexWorkspaceSources(buildTool.data, progress)
+        indexWorkspaceSources(
+          buildTool.data,
+          progress,
+          resetCompilers = false,
+        )
       }
+    indexProviders.restartFallbackCompilers()
+    val buildTargetCompilersReady =
+      if (
+        bspSession.exists(session =>
+          MbtBuildServer.isMbtServer(session.main.name)
+        ) && userConfig.javaSymbolLoader.isTurbineClasspath
+      ) {
+        mbtSymbolSearch
+          .recompileTurbineClasspath()
+          .flatMap(_ => resetPresentationCompilers())
+      } else {
+        resetPresentationCompilers()
+      }
+    buildTargetCompilersReady.onComplete(_ =>
+      initialBuildTargetsReady.trySuccess(())
+    )
+    timerProvider.timedThunk(
+      "post update build targets stuff",
+      clientConfig.initialConfig.statistics.isIndex,
+      metricName = Some("index_workspace_post_update_build_targets"),
+    ) {
+      progress.message = "analyzing build targets"
+      check()
+    }
     timerProvider.timedThunk(
       "indexed library classpath",
       clientConfig.initialConfig.statistics.isIndex,
@@ -381,12 +399,9 @@ case class Indexer(indexProviders: IndexProviders, mbtBuild: () => MbtBuild)(
           topWrapperLineCount + scPos.getLine,
           scPos.getCharacter,
         )
-    val fromScala: Position => Position =
-      scalaPos =>
-        new Position(
-          scalaPos.getLine - topWrapperLineCount,
-          scalaPos.getCharacter,
-        )
+    val fromScala: LineColumn => LineColumn = { case (line, column) =>
+      (line - topWrapperLineCount, column)
+    }
 
     new TargetData.MappedSource {
       def path = generatedPath
@@ -452,11 +467,17 @@ case class Indexer(indexProviders: IndexProviders, mbtBuild: () => MbtBuild)(
   def indexWorkspaceSources(
       data: Seq[TargetData],
       progress: TaskProgress = TaskProgress.empty,
+      resetCompilers: Boolean = true,
   ): Unit = {
     for (data0 <- data.iterator)
-      indexWorkspaceSources(data0, progress)
+      indexWorkspaceSources(data0, progress, resetCompilers = false)
+    if (resetCompilers) resetPresentationCompilers()
   }
-  def indexWorkspaceSources(data: TargetData, progress: TaskProgress): Unit = {
+  def indexWorkspaceSources(
+      data: TargetData,
+      progress: TaskProgress,
+      resetCompilers: Boolean,
+  ): Unit = {
     case class SourceToIndex(
         source: AbsolutePath,
         sourceItem: AbsolutePath,
@@ -477,7 +498,7 @@ case class Indexer(indexProviders: IndexProviders, mbtBuild: () => MbtBuild)(
     // at this point we have all sources for each build target, so presentation compilers should
     // restart to pick up the correct sourcepath. We don't need to wait for the actual
     // indexing to finish since they don't impact how the presentation compiler works
-    resetPresentationCompilers()
+    if (resetCompilers) resetPresentationCompilers()
 
     val threadPool = new ForkJoinPool(
       Runtime.getRuntime().availableProcessors() match {
@@ -822,6 +843,7 @@ case class Indexer(indexProviders: IndexProviders, mbtBuild: () => MbtBuild)(
               allSymbols,
               references,
               methodSymbols.toSeq,
+              optMtags.fold(Nil: MtagsIndexer.AllOverrides)(_.overrides()),
               updateDocumentKeys,
             )
           )

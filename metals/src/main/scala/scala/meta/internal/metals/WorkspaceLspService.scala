@@ -29,6 +29,7 @@ import scala.meta.internal.metals.clients.language.ConfiguredLanguageClient
 import scala.meta.internal.metals.clients.language.MetalsLanguageClient
 import scala.meta.internal.metals.clients.language.MetalsTerminalInputParams
 import scala.meta.internal.metals.config.StatusBarState
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.metals.debug.DebugProvider
 import scala.meta.internal.metals.debug.DiscoveryFailures
 import scala.meta.internal.metals.doctor.DoctorVisibilityDidChangeParams
@@ -261,6 +262,8 @@ class WorkspaceLspService(
       featureFlags,
       metrics,
       moduleStatus,
+      workspaceFolders = () =>
+        (folderServices.map(_.path) ++ nonScalaProjects.map(_.path)).distinct,
     )
   }
 

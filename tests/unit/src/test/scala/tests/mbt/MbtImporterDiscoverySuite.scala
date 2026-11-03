@@ -9,8 +9,9 @@ import scala.meta.internal.builds.BazelProjectViewTargets
 import scala.meta.internal.builds.BuildTools
 import scala.meta.internal.builds.ShellRunner
 import scala.meta.internal.metals.EmptyWorkDoneProgress
+import scala.meta.internal.metals.MetalsServerConfig
 import scala.meta.internal.metals.Time
-import scala.meta.internal.metals.UserConfiguration
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.metals.mbt.importer.BazelMbtImporter
 import scala.meta.internal.metals.mbt.importer.ScriptMbtImporter
 import scala.meta.io.AbsolutePath
@@ -26,6 +27,7 @@ class MbtImporterDiscoverySuite extends BaseSuite {
       workspace,
       bspGlobalDirectories = Nil,
       userConfig = () => UserConfiguration(),
+      metalsServerConfig = MetalsServerConfig.default,
       explicitChoiceMade = () => false,
       charset = StandardCharsets.UTF_8,
       shellRunner = new ShellRunner(
@@ -34,6 +36,7 @@ class MbtImporterDiscoverySuite extends BaseSuite {
         () => UserConfiguration(),
       ),
       ec = ec,
+      mbtWorkspaceSymbolProvider = None,
     )
 
   private def write(path: AbsolutePath, content: String = ""): Unit = {

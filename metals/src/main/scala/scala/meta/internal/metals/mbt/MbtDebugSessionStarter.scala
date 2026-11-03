@@ -1,7 +1,9 @@
 package scala.meta.internal.metals.mbt
 
 import java.net.URI
+import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
@@ -10,16 +12,20 @@ import scala.concurrent.duration.Duration
 
 import scala.meta.internal.metals.BaseWorkDoneProgress
 import scala.meta.internal.metals.JdkSources
+import scala.meta.internal.metals.debug.BuildTargetClasses
+import scala.meta.internal.metals.debug.TestFrameworkUtils
 import scala.meta.internal.metals.debug.server.BuildToolDebugAdapter
 import scala.meta.internal.metals.debug.server.DebugLogger
 import scala.meta.internal.metals.debug.server.DebugeeParamsCreator
 import scala.meta.internal.metals.debug.server.DebugeeProject
 import scala.meta.internal.metals.debug.server.ForkedTestDebugAdapter
 import scala.meta.internal.metals.debug.server.MetalsDebugToolsResolver
+import scala.meta.internal.metals.testProvider.TestSuitesProvider
 import scala.meta.internal.process.ProcessOutput
 import scala.meta.internal.process.SystemProcess
 import scala.meta.io.AbsolutePath
 
+import bloop.config.Config.TestFramework
 import ch.epfl.scala.bsp4j.ScalaMainClass
 import ch.epfl.scala.bsp4j.ScalaTestSuites
 import ch.epfl.scala.debugadapter.MultiOutputModule
@@ -30,10 +36,8 @@ class MbtDebugSessionStarter(
     buildTool: MbtDebugLauncher,
     userJavaHome: () => Option[String],
     workDoneProgress: BaseWorkDoneProgress,
-    classToSourceFile: (
-        String,
-        ch.epfl.scala.bsp4j.BuildTargetIdentifier,
-    ) => Option[AbsolutePath] = (_, _) => None,
+    buildTargetClasses: BuildTargetClasses,
+    testProvider: TestSuitesProvider,
     debuggeeGracePeriodSeconds: Long = 60L,
 )(implicit ec: ExecutionContext) {
 
@@ -41,22 +45,25 @@ class MbtDebugSessionStarter(
       target: MbtTarget,
       mainClass: ScalaMainClass,
       workspace: AbsolutePath,
+      cancel: Promise[Unit],
   ): Future[URI] = {
-    launchVia(buildTool, target, mainClass, workspace)
+    launchVia(buildTool, target, mainClass, workspace, cancel)
   }
 
   def startDebugTest(
       target: MbtTarget,
       testSuites: ScalaTestSuites,
       workspace: AbsolutePath,
+      cancel: Promise[Unit],
   ): Future[URI] =
-    launchTestVia(buildTool, target, testSuites, workspace)
+    launchTestVia(buildTool, target, testSuites, workspace, cancel)
 
   def compile(
       target: MbtTarget,
       workspace: AbsolutePath,
       out: String => Unit,
       err: String => Unit,
+      cancel: Promise[Unit],
   ): Future[Int] = {
     val command = buildTool.mbtCompileCommand(workspace, target)
     val toolName = buildTool.executableName
@@ -67,18 +74,14 @@ class MbtDebugSessionStarter(
       val parts = target.name.split(':')
       if (parts.length >= 2) parts(1) else target.name
     }
-    workDoneProgress.trackFuture(
-      s"Compiling $artifactId",
-      SystemProcess
-        .run(
-          command,
-          workspace,
-          redirectErrorOutput = false,
-          env = javaHomeEnv(target),
-          processOut = Some(ProcessOutput.Lines(out)),
-          processErr = Some(err),
-        )
-        .complete,
+    runCancellable(
+      command,
+      workspace,
+      javaHomeEnv(target),
+      out,
+      err,
+      cancel,
+      progress = Some(s"Compiling $artifactId"),
     )
   }
 
@@ -88,22 +91,13 @@ class MbtDebugSessionStarter(
       workspace: AbsolutePath,
       out: String => Unit,
       err: String => Unit,
+      cancel: Promise[Unit],
   ): Future[Int] = {
     val command = buildTool.mbtRunCommand(workspace, target, mainClass)
     scribe.info(
       s"MBT run session via ${buildTool.executableName}: ${redactedCommand(command)}"
     )
-    SystemProcess
-      .run(
-        command,
-        workspace,
-        redirectErrorOutput = false,
-        env = javaHomeEnv(target),
-        processOut = Some(ProcessOutput.Lines(out)),
-        processErr = Some(err),
-      )
-      .complete
-
+    runInTerminal(command, target, workspace, out, err, cancel)
   }
 
   private def resolveSourceFiles(
@@ -112,7 +106,31 @@ class MbtDebugSessionStarter(
   ): Seq[AbsolutePath] =
     MbtDebugLauncher
       .listOrNil(testSuites.getSuites)
-      .flatMap(s => classToSourceFile(s.getClassName, target.id))
+      .flatMap(s =>
+        buildTargetClasses.sourceFileForMbtTestClass(s.getClassName, target.id)
+      )
+
+  private def frameworkOf(
+      target: MbtTarget,
+      testSuites: ScalaTestSuites,
+  ): Option[TestFramework] = {
+    val className = MbtDebugLauncher
+      .listOrNil(testSuites.getSuites)
+      .headOption
+      .map(_.getClassName)
+    className.flatMap { name =>
+      val fromIndex =
+        buildTargetClasses.frameworkForMbtTestClass(name, target.id)
+      val fromDeclared = target.testClasses
+        .find(_.className == name)
+        .flatMap(tc => Option(tc.framework))
+        .map(fw => TestFrameworkUtils.from(Some(fw)))
+      fromIndex
+        .filter(_.names.nonEmpty)
+        .orElse(fromDeclared.filter(_.names.nonEmpty))
+        .orElse(fromIndex)
+    }
+  }
 
   def test(
       target: MbtTarget,
@@ -120,32 +138,106 @@ class MbtDebugSessionStarter(
       workspace: AbsolutePath,
       out: String => Unit,
       err: String => Unit,
-  ): Future[Int] = {
+      cancel: Promise[Unit],
+  ): Future[MbtTestRunResult] = {
     val sourceFiles = resolveSourceFiles(target, testSuites)
-    val command =
-      buildTool.mbtTestCommand(workspace, target, testSuites, sourceFiles)
+    val commandFuture = buildTool.mbtTestCommand(
+      workspace,
+      target,
+      testSuites,
+      sourceFiles,
+      frameworkOf(target, testSuites),
+    )
     val toolName = buildTool.executableName
     val artifactId = {
       val parts = target.name.split(':')
       if (parts.length >= 2) parts(1) else target.name
     }
-    command.flatMap { command =>
+    commandFuture.flatMap { testCommand =>
       scribe.info(
-        s"MBT test session via $toolName: ${redactedCommand(command)}"
+        s"MBT test session via $toolName: ${redactedCommand(testCommand.arguments)}"
       )
-      workDoneProgress.trackFuture(
-        s"Testing $artifactId",
-        SystemProcess
-          .run(
-            command,
-            workspace,
-            redirectErrorOutput = false,
-            env = javaHomeEnv(target),
-            processOut = Some(ProcessOutput.Lines(out)),
-            processErr = Some(err),
-          )
-          .complete,
-      )
+      runInTerminal(
+        testCommand.arguments,
+        target,
+        workspace,
+        out,
+        err,
+        cancel,
+        progress = Some(s"Testing $artifactId"),
+      ).map { exitCode =>
+        MbtTestRunResult(exitCode, testCommand.consumeReport())
+      }
+    }
+  }
+
+  private def runInTerminal(
+      command: List[String],
+      target: MbtTarget,
+      workspace: AbsolutePath,
+      out: String => Unit,
+      err: String => Unit,
+      cancel: Promise[Unit],
+      progress: Option[String] = None,
+  ): Future[Int] = {
+    out(s"> ${renderCommand(command)}")
+    runCancellable(
+      command,
+      workspace,
+      javaHomeEnv(target),
+      out,
+      err,
+      cancel,
+      progress,
+    )
+  }
+
+  private def renderCommand(command: List[String]): String =
+    command.map(renderArgument).mkString(" ")
+
+  private def renderArgument(argument: String): String = {
+    val escaped = argument.flatMap {
+      case '\\' => "\\\\"
+      case '"' => "\\\""
+      case '\n' => "\\n"
+      case '\r' => "\\r"
+      case '\t' => "\\t"
+      case char if Character.isISOControl(char) => f"\\u${char.toInt}%04x"
+      case char => char.toString
+    }
+    s"\"$escaped\""
+  }
+
+  /**
+   * Runs a build-tool command and stops it when `cancel` completes or the
+   * progress bar is cancelled. The progress future completes with the process,
+   * so killing the process also ends the progress notification.
+   */
+  private def runCancellable(
+      command: List[String],
+      workspace: AbsolutePath,
+      env: Map[String, String],
+      out: String => Unit,
+      err: String => Unit,
+      cancel: Promise[Unit],
+      progress: Option[String],
+  ): Future[Int] = {
+    val process = SystemProcess.run(
+      command,
+      workspace,
+      redirectErrorOutput = false,
+      env = env,
+      processOut = Some(ProcessOutput.Lines(out)),
+      processErr = Some(err),
+    )
+    val stop = () => {
+      cancel.trySuccess(())
+      ()
+    }
+    cancel.future.foreach(_ => process.cancel)
+    val done = process.complete
+    progress.fold(done) { message =>
+      workDoneProgress.trackFuture(message, done, onCancel = Some(stop))
     }
   }
 
@@ -154,6 +246,7 @@ class MbtDebugSessionStarter(
       target: MbtTarget,
       mainClass: ScalaMainClass,
       workspace: AbsolutePath,
+      cancel: Promise[Unit],
   ): Future[URI] = {
     val command = launcher.mbtDebugCommand(
       workspace,
@@ -162,38 +255,43 @@ class MbtDebugSessionStarter(
       MbtDebugLauncher.DebugAgentFlag,
     )
     val toolName = launcher.executableName
-    val cancelPromise = Promise[Unit]()
-    compile(target, workspace, scribe.info(_), scribe.warn(_)).flatMap { _ =>
-      debugConfigCreator.create(
-        target.id,
-        cancelPromise,
-        isTests = false,
-      ) match {
-        case Left(error) => Future.failed(new IllegalStateException(error))
-        case Right(projectFuture) =>
-          projectFuture.map { project =>
-            val patched =
-              patchProjectForRun(project, target, workspace, toolName)
-            scribe.info(
-              s"MBT debug session via $toolName: ${redactedCommand(command)}"
-            )
-            val debuggee = new BuildToolDebugAdapter(
-              Future.successful(command),
-              workspace,
-              env = javaHomeEnv(target),
-              patched,
-              userJavaHome(),
-            )
-            val handler = dap.DebugServer.run(
-              debuggee,
-              new MetalsDebugToolsResolver(),
-              new DebugLogger(),
-              gracePeriod =
-                Duration(debuggeeGracePeriodSeconds, TimeUnit.SECONDS),
-            )
-            handler.uri
+    compile(target, workspace, scribe.info(_), scribe.warn(_), cancel).flatMap {
+      _ =>
+        if (cancel.isCompleted)
+          Future.failed(
+            new CancellationException("MBT debug session cancelled")
+          )
+        else
+          debugConfigCreator.create(
+            target.id,
+            cancel,
+            isTests = false,
+          ) match {
+            case Left(error) => Future.failed(new IllegalStateException(error))
+            case Right(projectFuture) =>
+              projectFuture.map { project =>
+                val patched =
+                  patchProjectForRun(project, target, workspace, toolName)
+                scribe.info(
+                  s"MBT debug session via $toolName: ${redactedCommand(command)}"
+                )
+                val debuggee = new BuildToolDebugAdapter(
+                  Future.successful(command),
+                  workspace,
+                  env = javaHomeEnv(target),
+                  patched,
+                  userJavaHome(),
+                )
+                val handler = dap.DebugServer.run(
+                  debuggee,
+                  new MetalsDebugToolsResolver(),
+                  new DebugLogger(),
+                  gracePeriod =
+                    Duration(debuggeeGracePeriodSeconds, TimeUnit.SECONDS),
+                )
+                handler.uri
+              }
           }
-      }
     }
   }
 
@@ -202,81 +300,104 @@ class MbtDebugSessionStarter(
       target: MbtTarget,
       testSuites: ScalaTestSuites,
       workspace: AbsolutePath,
+      cancel: Promise[Unit],
   ): Future[URI] = {
     val toolName = launcher.executableName
-    val cancelPromise = Promise[Unit]()
     val sourceFiles = resolveSourceFiles(target, testSuites)
-    compile(target, workspace, scribe.info(_), scribe.warn(_)).flatMap { _ =>
-      debugConfigCreator.create(
-        target.id,
-        cancelPromise,
-        isTests = true,
-      ) match {
-        case Left(error) => Future.failed(new IllegalStateException(error))
-        case Right(projectFuture) =>
-          projectFuture.map { project =>
-            val patched =
-              patchProjectForRun(
-                project,
-                target,
-                workspace,
-                toolName,
-                isTests = true,
-              )
-            val innerDebuggee =
-              if (launcher.supportsForkedTestDebug) {
-                val commandWithPort =
-                  launcher.mbtTestDebugCommandWithPort(
-                    workspace,
+    compile(target, workspace, scribe.info(_), scribe.warn(_), cancel).flatMap {
+      _ =>
+        if (cancel.isCompleted)
+          Future.failed(
+            new CancellationException("MBT debug session cancelled")
+          )
+        else
+          debugConfigCreator.create(
+            target.id,
+            cancel,
+            isTests = true,
+          ) match {
+            case Left(error) => Future.failed(new IllegalStateException(error))
+            case Right(projectFuture) =>
+              projectFuture.map { project =>
+                val patched =
+                  patchProjectForRun(
+                    project,
                     target,
+                    workspace,
+                    toolName,
+                    isTests = true,
+                  )
+                val reportReader =
+                  new AtomicReference[() => MbtTestReport](() =>
+                    MbtTestReport.empty
+                  )
+                def arguments(
+                    command: Future[MbtTestCommand],
+                    suffix: String,
+                ): Future[List[String]] =
+                  command.map { testCommand =>
+                    reportReader.set(testCommand.consumeReport)
+                    scribe.info(
+                      s"MBT test debug session via $toolName$suffix: ${redactedCommand(testCommand.arguments)}"
+                    )
+                    testCommand.arguments
+                  }(ExecutionContext.parasitic)
+                val innerDebuggee =
+                  if (launcher.supportsForkedTestDebug) {
+                    val testCommandWithPort =
+                      launcher.mbtTestDebugCommandWithPort(
+                        workspace,
+                        target,
+                        testSuites,
+                        sourceFiles,
+                        frameworkOf(target, testSuites),
+                      )
+                    new ForkedTestDebugAdapter(
+                      port => arguments(testCommandWithPort(port), " (forked)"),
+                      workspace,
+                      env = javaHomeEnv(target),
+                      patched,
+                      userJavaHome(),
+                    )
+                  } else {
+                    val debugAgentFlag = MbtDebugLauncher.DebugAgentFlag
+                    val commandFuture = arguments(
+                      launcher.mbtTestDebugCommand(
+                        workspace,
+                        target,
+                        testSuites,
+                        debugAgentFlag,
+                        sourceFiles,
+                        frameworkOf(target, testSuites),
+                      ),
+                      "",
+                    )
+                    new BuildToolDebugAdapter(
+                      commandFuture,
+                      workspace,
+                      env = javaHomeEnv(target),
+                      patched,
+                      userJavaHome(),
+                    )
+                  }
+                val debuggee =
+                  new MbtTestResultAdapter(
+                    innerDebuggee,
                     testSuites,
-                    sourceFiles,
+                    testProvider,
+                    target.id,
+                    consumeReport = () => reportReader.get()(),
                   )
-                commandWithPort(0).foreach { command =>
-                  scribe.info(
-                    s"MBT test debug session via $toolName (forked): ${redactedCommand(command)}"
-                  )
-                }
-                new ForkedTestDebugAdapter(
-                  commandWithPort,
-                  workspace,
-                  env = javaHomeEnv(target),
-                  patched,
-                  userJavaHome(),
+                val handler = dap.DebugServer.run(
+                  debuggee,
+                  new MetalsDebugToolsResolver(),
+                  new DebugLogger(),
+                  gracePeriod =
+                    Duration(debuggeeGracePeriodSeconds, TimeUnit.SECONDS),
                 )
-              } else {
-                val debugAgentFlag = MbtDebugLauncher.DebugAgentFlag
-                val commandFuture = launcher.mbtTestDebugCommand(
-                  workspace,
-                  target,
-                  testSuites,
-                  debugAgentFlag,
-                  sourceFiles,
-                )
-                commandFuture.foreach { command =>
-                  scribe.info(
-                    s"MBT test debug session via $toolName: ${redactedCommand(command)}"
-                  )
-                }
-                new BuildToolDebugAdapter(
-                  commandFuture,
-                  workspace,
-                  env = javaHomeEnv(target),
-                  patched,
-                  userJavaHome(),
-                )
+                handler.uri
               }
-            val debuggee = MbtTestResultAdapter(innerDebuggee, testSuites)
-            val handler = dap.DebugServer.run(
-              debuggee,
-              new MetalsDebugToolsResolver(),
-              new DebugLogger(),
-              gracePeriod =
-                Duration(debuggeeGracePeriodSeconds, TimeUnit.SECONDS),
-            )
-            handler.uri
           }
-      }
     }
   }
 

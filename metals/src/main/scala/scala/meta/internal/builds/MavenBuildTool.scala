@@ -2,20 +2,25 @@ package scala.meta.internal.builds
 
 import java.nio.file.Files
 import java.nio.file.Paths
+import java.nio.file.attribute.FileTime
 
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.util.Properties
+import scala.util.Try
 
 import scala.meta.internal.metals.BuildInfo
 import scala.meta.internal.metals.JavaBinary
 import scala.meta.internal.metals.MetalsEnrichments._
-import scala.meta.internal.metals.UserConfiguration
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.metals.mbt.MbtDebugLauncher
 import scala.meta.internal.metals.mbt.MbtTarget
+import scala.meta.internal.metals.mbt.MbtTestCommand
+import scala.meta.internal.metals.mbt.MbtTestReport
 import scala.meta.internal.metals.mbt.importer.MavenMbtImporter
 import scala.meta.io.AbsolutePath
 
+import bloop.config.Config.TestFramework
 import ch.epfl.scala.bsp4j.ScalaMainClass
 import ch.epfl.scala.bsp4j.ScalaTestSuites
 
@@ -171,14 +176,60 @@ case class MavenBuildTool(
       target: MbtTarget,
       testSuites: ScalaTestSuites,
       sourceFiles: Seq[AbsolutePath],
-  ): Future[List[String]] =
+      framework: Option[TestFramework] = None,
+  ): Future[MbtTestCommand] =
     Future.successful(
-      mbtTestExecCommand(
-        mbtMavenBaseCommand(workspace),
+      withTestReport(
+        workspace,
         target,
-        testSuites,
+        mbtTestExecCommand(
+          mbtMavenBaseCommand(workspace),
+          target,
+          testSuites,
+          framework,
+        ),
       )
     )
+
+  private def withTestReport(
+      workspace: AbsolutePath,
+      target: MbtTarget,
+      arguments: List[String],
+  ): MbtTestCommand = {
+    val reportDirectories = (
+      mavenModuleDirectory(target)
+        .getOrElse(workspace)
+        .resolve("target/surefire-reports") ::
+        target
+          .runClassDirectories(workspace, "maven", includeTests = true)
+          .map(_.parent.resolve("surefire-reports"))
+    ).distinct
+    MbtTestCommand(arguments, changedMavenTestReport(reportDirectories))
+  }
+
+  private def changedMavenTestReport(
+      directories: List[AbsolutePath]
+  ): () => MbtTestReport = {
+    def fingerprint(report: AbsolutePath): Option[(FileTime, Long)] =
+      Try(
+        (Files.getLastModifiedTime(report.toNIO), Files.size(report.toNIO))
+      ).toOption
+    val snapshot = MbtTestReport
+      .xmlFiles(directories)
+      .flatMap(report => fingerprint(report).map(report -> _))
+      .toMap
+    () => {
+      val changed = MbtTestReport
+        .xmlFiles(directories)
+        .filter { report =>
+          snapshot.get(report) match {
+            case None => true
+            case Some(baseline) => !fingerprint(report).contains(baseline)
+          }
+        }
+      MbtTestReport.readJunitReports(changed, "changed Maven test reports")
+    }
+  }
 
   override def mbtTestDebugCommand(
       workspace: AbsolutePath,
@@ -186,10 +237,15 @@ case class MavenBuildTool(
       testSuites: ScalaTestSuites,
       debugAgentFlag: String,
       sourceFiles: Seq[AbsolutePath],
-  ): Future[List[String]] =
-    mbtTestDebugCommandWithPort(workspace, target, testSuites, sourceFiles)(
-      5005
-    )
+      framework: Option[TestFramework] = None,
+  ): Future[MbtTestCommand] =
+    mbtTestDebugCommandWithPort(
+      workspace,
+      target,
+      testSuites,
+      sourceFiles,
+      framework,
+    )(5005)
 
   override def supportsForkedTestDebug: Boolean = true
 
@@ -198,25 +254,32 @@ case class MavenBuildTool(
       target: MbtTarget,
       testSuites: ScalaTestSuites,
       sourceFiles: Seq[AbsolutePath],
-  ): Int => Future[List[String]] = { port =>
+      framework: Option[TestFramework] = None,
+  ): Int => Future[MbtTestCommand] = { port =>
     // Use Surefire's forked JVM with a pre-assigned debug port.
     // This allows proper source mapping since tests run in a separate JVM.
     val debugAgentFlag =
       s"\"-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=*:$port\""
-    Future.successful(
-      mbtTestExecCommand(
-        mbtMavenBaseCommand(workspace),
+    Future.successful {
+      withTestReport(
+        workspace,
         target,
-        testSuites,
-        forkedDebugAgentFlag = Some(debugAgentFlag),
+        mbtTestExecCommand(
+          mbtMavenBaseCommand(workspace),
+          target,
+          testSuites,
+          framework,
+          forkedDebugAgentFlag = Some(debugAgentFlag),
+        ),
       )
-    )
+    }
   }
 
   private def mbtTestExecCommand(
       baseCommand: List[String],
       target: MbtTarget,
       testSuites: ScalaTestSuites,
+      framework: Option[TestFramework],
       forkedDebugAgentFlag: Option[String] = None,
   ): List[String] = {
     val moduleArgs =
@@ -230,7 +293,7 @@ case class MavenBuildTool(
     val suites = MbtDebugLauncher.listOrNil(testSuites.getSuites)
     val testFilter = suites.flatMap { suite =>
       val className = suite.getClassName
-      val tests = MbtDebugLauncher.listOrNil(suite.getTests)
+      val tests = MbtDebugLauncher.testFilterNames(suite, framework)
       if (tests.isEmpty) List(className)
       else tests.map(test => s"$className#$test")
     }

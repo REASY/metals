@@ -14,11 +14,13 @@ import scala.meta.internal.io.PathIO
 import scala.meta.internal.metals.Directories
 import scala.meta.internal.metals.EmptyWorkDoneProgress
 import scala.meta.internal.metals.MetalsEnrichments._
+import scala.meta.internal.metals.MetalsServerConfig
 import scala.meta.internal.metals.Tables
 import scala.meta.internal.metals.Time
-import scala.meta.internal.metals.UserConfiguration
 import scala.meta.internal.metals.bloop.BloopServers
 import scala.meta.internal.metals.clients.language.MetalsLanguageClient
+import scala.meta.internal.metals.config.UserConfiguration
+import scala.meta.internal.metals.mbt.MbtWorkspaceSymbolProvider
 import scala.meta.internal.metals.mbt.importer.MbtImportProvider
 import scala.meta.internal.metals.mbt.importer.ScriptMbtImporter
 import scala.meta.internal.metals.scalacli.ScalaCli
@@ -42,10 +44,12 @@ final class BuildTools(
     workspace: AbsolutePath,
     bspGlobalDirectories: List[AbsolutePath],
     userConfig: () => UserConfiguration,
+    metalsServerConfig: MetalsServerConfig,
     explicitChoiceMade: () => Boolean,
     charset: Charset,
     shellRunner: ShellRunner,
     ec: ExecutionContext,
+    mbtWorkspaceSymbolProvider: Option[MbtWorkspaceSymbolProvider],
 ) {
   private val lastDetectedBuildTools = new AtomicReference(
     Map.empty[String, BuildTool]
@@ -236,7 +240,14 @@ final class BuildTools(
       GradleBuildTool(userConfig, workspace)(ec),
       MillBuildTool(userConfig, workspace),
       ScalaCliBuildTool(workspace, workspace, userConfig),
-      BazelBuildTool(userConfig, workspace, shellRunner, ec),
+      BazelBuildTool(
+        userConfig,
+        workspace,
+        shellRunner,
+        ec,
+        mbtWorkspaceSymbolProvider,
+        metalsServerConfig,
+      ),
       DederBuildTool(userConfig, workspace),
     )
   }
@@ -274,6 +285,8 @@ final class BuildTools(
         root,
         shellRunner,
         ec,
+        mbtWorkspaceSymbolProvider,
+        metalsServerConfig,
         languageClient,
         tables,
       )
@@ -318,9 +331,25 @@ final class BuildTools(
    */
   def hasMbtImporters: Boolean =
     loadSupported().exists(_.isInstanceOf[MbtImportProvider]) ||
-      workspace.list.exists(f =>
-        ScriptMbtImporter.scriptExtensions.exists(f.filename.endsWith(_))
-      )
+      hasScriptMbtImporters
+
+  /**
+   * Whether MBT should discover main/test classes from the symbol index.
+   *
+   * Bazel already declares them in `mbt.json`, so skip discovery only when
+   * Bazel is the sole MBT importer. Maven, Gradle, and scripts still need
+   * index discovery, including in mixed workspaces that also contain Bazel.
+   */
+  def discoverMbtClassesFromIndex: Boolean = {
+    val importers = loadSupported().collect { case p: MbtImportProvider => p }
+    importers.exists(_.name != BazelBuildTool.name) || hasScriptMbtImporters ||
+    importers.isEmpty
+  }
+
+  private def hasScriptMbtImporters: Boolean =
+    workspace.list.exists(f =>
+      ScriptMbtImporter.scriptExtensions.exists(f.filename.endsWith(_))
+    )
 
   def mbtImporters(
       shellRunner: ShellRunner,
@@ -373,6 +402,7 @@ object BuildTools {
       workspace,
       Nil,
       () => UserConfiguration(),
+      metalsServerConfig = MetalsServerConfig.default,
       explicitChoiceMade = () => false,
       charset = StandardCharsets.UTF_8,
       shellRunner = new ShellRunner(
@@ -381,6 +411,7 @@ object BuildTools {
         () => UserConfiguration(),
       )(ExecutionContext.global),
       ec = ExecutionContext.global,
+      mbtWorkspaceSymbolProvider = None,
     )
 
   /** All known build tool executable names for configuration validation */

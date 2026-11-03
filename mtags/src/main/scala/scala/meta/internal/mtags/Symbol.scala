@@ -70,8 +70,24 @@ final class Symbol private (val value: String) {
    * [[toplevelBinaryName]] with `.` between package parts, the form
    * `Class.forName` expects: `scala/Option#get().` becomes `scala.Option`.
    */
-  def toplevelClassName: String =
-    toplevelBinaryName.replace('/', '.')
+  def toplevelClassName: String = {
+    val suffix = if (toplevel.value.endsWith(".")) "$" else ""
+    toplevelBinaryName.replace('/', '.') + suffix
+  }
+
+  /**
+   * The JVMS 4.2.1 binary name of this class, `$` between the nesting levels:
+   * `a/B#` becomes `a/B`, `a/B#C#` becomes `a/B$C` and `a/B#C#D#` becomes
+   * `a/B$C$D`.
+   *
+   * Pass a type symbol. A member takes the same nesting rule, so `a/B#m().`
+   * comes out as `a/B$m`, which names no class the JVM loads. A class declared
+   * inside a method reads the same way: `a/B#m().C#` as `a/B$m$C`, where the
+   * JVM writes `a/B$1C`.
+   */
+  def binaryName: String =
+    if (isNone || value.isPackage || isToplevel) toplevelBinaryName
+    else s"${owner.binaryName}$$$displayName"
 
   def asNonEmpty: Option[Symbol] =
     if (isNone) None
@@ -108,8 +124,10 @@ object Symbol {
    * `scala/Option#`. Toplevel, since a nested class is `Outer.Inner` there but
    * `Outer#Inner#` here.
    */
-  def fromToplevelClassName(className: String): Symbol =
-    Symbol(className.replace('.', '/') + "#")
+  def fromToplevelClassName(className: String): Symbol = {
+    val suffix = if (className.endsWith("$")) "." else "#"
+    Symbol(className.replace('.', '/') + suffix)
+  }
 
   def validated(sym: String): Either[String, Symbol] = {
     // NOTE(olafur): this validation method is hacky, we should write a proper

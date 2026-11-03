@@ -46,6 +46,7 @@ final class BuildTargetClasses(
     symbolIndex: OnDemandSymbolIndex,
     mbt: () => Option[MbtWorkspaceSymbolProvider] = () => None,
     workDoneProgress: BaseWorkDoneProgress = EmptyWorkDoneProgress,
+    shouldDiscoverMbtClasses: () => Boolean = () => true,
 )(implicit
     val ec: ExecutionContext
 ) extends SemanticdbFeatureProvider {
@@ -133,6 +134,12 @@ final class BuildTargetClasses(
   ): Option[AbsolutePath] =
     index.get(targetId).flatMap(_.confirmedMbtTestClassFile.get(className))
 
+  def frameworkForMbtTestClass(
+      className: String,
+      targetId: b.BuildTargetIdentifier,
+  ): Option[TestFramework] =
+    getTestClasses(className, targetId).headOption.map(_._2.framework)
+
   def resolveCandidateTestClass(
       name: String,
       target: Option[String],
@@ -212,8 +219,13 @@ final class BuildTargetClasses(
                 .map(cacheTestClasses(classes, _))
             }
 
+          // Bazel MBT already declares main/test classes in mbt.json, so skip
+          // index discovery. Maven and Gradle still rely on it.
           val populateMbtClasses =
-            if (MbtBuildServer.isMbtServer(connection.name)) {
+            if (
+              MbtBuildServer.isMbtServer(connection.name) &&
+              shouldDiscoverMbtClasses()
+            ) {
               populateMbtMainClasses(classes, targets0).flatMap { _ =>
                 populateMbtTestClasses(classes, targets0)
               }
@@ -848,15 +860,19 @@ final class BuildTargetClasses(
     if (!hasCandidates) {
       Future.unit
     } else {
-      foreachMbtSemanticdbDocument(Seq(path)) { doc =>
-        processMbtTestSemanticdb(doc.uri.toAbsolutePath, doc, targetIds)
-      }
+      confirmMbtTestClassCandidatePaths(
+        Seq(path),
+        _ => targetIds,
+      )
     }
   }
 
   /**
    * Confirms candidate test classes for specific targets.
    * This is useful when the user opens the test explorer and wants to discover all tests.
+   *
+   * Java candidates are confirmed from Turbine class info. Scala candidates still
+   * go through semanticdb.
    *
    * @param targetIds The build targets to confirm candidates for
    * @return Future that completes when confirmation is done
@@ -875,16 +891,39 @@ final class BuildTargetClasses(
     if (distinctPaths.isEmpty) {
       Future.unit
     } else {
-      foreachMbtSemanticdbDocument(distinctPaths) { doc =>
-        val docPath = doc.uri.toAbsolutePath
-        val docTargetIds = buildTargets.inverseSourcesAll(docPath)
-        processMbtTestSemanticdb(
-          docPath,
-          doc,
-          docTargetIds.filter(targetIds.contains),
+      confirmMbtTestClassCandidatePaths(
+        distinctPaths,
+        path => buildTargets.inverseSourcesAll(path).filter(targetIds.contains),
+      )
+    }
+  }
+
+  private def confirmMbtTestClassCandidatePaths(
+      paths: Seq[AbsolutePath],
+      targetsForPath: AbsolutePath => Seq[b.BuildTargetIdentifier],
+  ): Future[Unit] = {
+    val (javaPaths, otherPaths) = paths.partition(_.isJava)
+    val javaConfirmation = Future {
+      for (path <- javaPaths) {
+        storeConfirmedTestClasses(
+          path,
+          extractTestClassesFromTurbine(path),
+          targetsForPath(path),
         )
       }
     }
+    val otherConfirmation =
+      if (otherPaths.isEmpty) Future.unit
+      else
+        foreachMbtSemanticdbDocument(otherPaths) { doc =>
+          val docPath = doc.uri.toAbsolutePath
+          processMbtTestSemanticdb(
+            docPath,
+            doc,
+            targetsForPath(docPath),
+          )
+        }
+    javaConfirmation.flatMap(_ => otherConfirmation)
   }
 
   /**
@@ -897,17 +936,45 @@ final class BuildTargetClasses(
       targetIds: Seq[b.BuildTargetIdentifier],
   ): Future[Unit] = {
     extractTestClassesFromDocument(doc, docPath).map { testClasses =>
-      for {
-        tid <- targetIds
-        classes <- index.get(tid)
-      } {
-        // Remove candidates for this path
-        classes.clearCandidateTestClasses(docPath)
+      storeConfirmedTestClasses(docPath, testClasses, targetIds)
+    }
+  }
 
-        // Extract and store confirmed test classes
-        for ((symbol, testInfo) <- testClasses) {
-          classes.putTestClass(symbol, testInfo, docPath)
+  private def extractTestClassesFromTurbine(
+      path: AbsolutePath
+  ): List[(String, TestSymbolInfo)] =
+    mbt() match {
+      case None => Nil
+      case Some(mbtProvider) =>
+        val result = mutable.LinkedHashMap.empty[String, TestSymbolInfo]
+        for {
+          info <- mbtProvider.classInfo(path)
+          annotation <- info.memberDefsAnnotations ++ info.annotations
+          framework <- TestFrameworkDetector.fromSymbol(annotation)
+        } {
+          result.put(
+            info.symbol,
+            TestSymbolInfo(
+              symbolToClassName(info.symbol),
+              framework,
+            ),
+          )
         }
+        result.toList
+    }
+
+  private def storeConfirmedTestClasses(
+      path: AbsolutePath,
+      testClasses: List[(String, TestSymbolInfo)],
+      targetIds: Seq[b.BuildTargetIdentifier],
+  ): Unit = {
+    for {
+      tid <- targetIds
+      classes <- index.get(tid)
+    } {
+      classes.clearCandidateTestClasses(path)
+      for ((symbol, testInfo) <- testClasses) {
+        classes.putTestClass(symbol, testInfo, path)
       }
     }
   }
@@ -1036,6 +1103,11 @@ object TestFrameworkSymbolRegistry {
       .map(_ -> TestFrameworkUtils.ZioTestFramework)
       .toMap
 
+  private lazy val kyoTestSymbols: Map[String, TestFramework] =
+    TestFrameworkUtils.kyoTestBaseClasses
+      .map(_ -> TestFrameworkUtils.KyoTestFramework)
+      .toMap
+
   private lazy val junitSymbols: Map[String, TestFramework] = Set(
     JunitTestFinder.junitBaseClassSymbol,
     JunitTestFinder.junitAnnotationSymbol,
@@ -1054,6 +1126,7 @@ object TestFrameworkSymbolRegistry {
       munitSymbols ++
       weaverSymbols ++
       zioTestSymbols ++
+      kyoTestSymbols ++
       junitSymbols ++
       testngSymbols
 
@@ -1063,11 +1136,20 @@ object TestFrameworkSymbolRegistry {
 
   /** Annotation symbols used by JUnit and TestNG test discovery. */
   def annotationSymbols: Seq[String] =
-    (junitSymbols.keys ++ testngSymbols.keys).toSeq.distinct
+    Seq(
+      JunitTestFinder.junitAnnotationSymbol,
+      JunitTestFinder.junit5AnnotationSymbol,
+    ) ++ testngSymbols.keys
 
-  /** Base class symbols used by ScalaTest, MUnit, Weaver, and ZIO Test discovery. */
+  /**
+   * Base class symbols used by ScalaTest, MUnit, Weaver, ZIO Test, and JUnit 3
+   * `TestCase` discovery. These are searched via inheritance, not as annotations.
+   */
   def baseParentSymbols: Seq[String] =
-    (scalatestSymbols.keys ++ munitSymbols.keys ++ weaverSymbols.keys ++ zioTestSymbols.keys).toSeq.distinct
+    (scalatestSymbols.keys ++ munitSymbols.keys ++ weaverSymbols.keys ++
+      zioTestSymbols.keys ++ Iterator(
+        JunitTestFinder.junitBaseClassSymbol
+      )).toSeq.distinct
 }
 
 object TestFrameworkUtils {
@@ -1077,6 +1159,18 @@ object TestFrameworkUtils {
 
   val ZioTestFramework: TestFramework = TestFramework(
     List("zio.test.sbt.ZTestFramework")
+  )
+
+  val KyoTestFramework: TestFramework = TestFramework(
+    List("kyo.test.runner.SbtFramework")
+  )
+
+  /** `SuiteFingerprintMarker` is what kyo-test's own sbt fingerprint matches. */
+  val kyoTestBaseClasses: Set[String] = Set(
+    "kyo/test/SuiteFingerprintMarker#",
+    "kyo/test/Test#",
+    "kyo/test/prop/PropertyTest#",
+    "kyo/test/snapshot/SnapshotTest#",
   )
 
   private lazy val supportedFrameworks = Set(
@@ -1096,6 +1190,7 @@ object TestFrameworkUtils {
       case "weaver-cats-effect" => WeaverTestFramework
       case "TestNG" => TestFramework.TestNG
       case x if x.contains("ZIO Test") => ZioTestFramework
+      case "kyo-test" => KyoTestFramework
       case _ => TestFramework(Nil)
     }
     .getOrElse(TestFramework(Nil))

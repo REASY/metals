@@ -19,8 +19,9 @@ import scala.util.control.NonFatal
 import scala.meta.infra.FeatureFlag
 import scala.meta.infra.FeatureFlagProvider
 import scala.meta.internal.jpc.JavaPresentationCompiler
-import scala.meta.internal.metals.Configs.SourcePathConfig
 import scala.meta.internal.metals.MetalsEnrichments._
+import scala.meta.internal.metals.config.SourcePathConfig
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.metals.mbt.GitVCS
 import scala.meta.internal.metals.mbt.MbtBuild
 import scala.meta.internal.metals.mbt.MbtWorkspaceSymbolProvider
@@ -77,7 +78,7 @@ class CompilerConfiguration(
    * This is controlled by the FULL_SOURCEPATH_FALLBACK_SCALA feature flag.
    */
   def shouldUseFullSourcepathForFallback: Boolean =
-    userConfig().fallbackSourcepath.enabled
+    userConfig().fallbackSourcepath.isAllSources
 
   /**
    * When `fallbackSourcepath` is enabled (see `shouldUseFullSourcepathForFallback`), supplies
@@ -147,7 +148,7 @@ class CompilerConfiguration(
       }
   }
   def shouldRunRefchecks: Boolean =
-    userConfig().additionalPcChecks.isRefchecks
+    userConfig().isRefchecksEnabled
 
   sealed trait MtagsPresentationCompiler {
     protected def awaitCompiler: PresentationCompiler
@@ -320,9 +321,13 @@ class CompilerConfiguration(
             val old = presentationCompilerRef.get()
             if (old != null) old
             else {
-              val newFallback = fallbackWithSources()
-              presentationCompilerRef.set(newFallback)
-              newFallback
+              lazy val newFallback = fallbackWithSources()
+              val didSetPc =
+                presentationCompilerRef.compareAndSet(null, newFallback)
+              if (!didSetPc) {
+                newFallback.shutdown()
+              }
+              presentationCompilerRef.get()
             }
           }
       }
@@ -453,9 +458,10 @@ class CompilerConfiguration(
       val pc = JavaPresentationCompiler()
       val shouldUseOpts = featureFlags
         .readBoolean(FeatureFlag.JAVAC_OPTIONS)
-        .orElse(false)
+        .orElse(true)
       val options = javaTarget match {
-        case j: JavaTarget if shouldUseOpts => j.options
+        case j: JavaTarget if shouldUseOpts =>
+          CompilerConfiguration.filterJavaPcOptions(j.options)
         case _ => Nil
       }
       configure(pc, search, completionItemPriority)
@@ -520,8 +526,8 @@ class CompilerConfiguration(
             javacServicesOverrides = userConfig().javacServicesOverrides,
             scalaImportsPlacement = userConfig().scalaImportsPlacement,
             batchSemanticdbCompilerInstances =
-              userConfig().batchSemanticdbCompilerInstances.instances,
-            protobufLspConfig = userConfig().protobufLspConfig,
+              userConfig().batchSemanticdbCompilerInstances,
+            protobufLspEnabled = userConfig().protobufLspEnabled,
           )
       }
 
@@ -641,12 +647,9 @@ class CompilerConfiguration(
           _ <-
             if (jvmVersion.major < metalsJavaVersion.major) Some(())
             else if (metalsJavaVersion.major > jvmVersion.major) {
-              scribe.warn(
-                s"""|Your project uses JDK version ${jvmVersion.major} and
-                    |Metals server is running on JDK version ${metalsJavaVersion.major}.
-                    |This might cause incorrect completions, since
-                    |Metals JDK version should be greater or equal the project's JDK version.
-                    |""".stripMargin
+              CompilerConfiguration.warnJdkVersionMismatch(
+                jvmVersion.major,
+                metalsJavaVersion.major,
               )
               None
             } else None
@@ -677,4 +680,72 @@ class CompilerConfiguration(
     } else {
       Nil
     }
+}
+
+object CompilerConfiguration {
+  private val excludedJavaPcOptionPrefixes = List(
+    "-J", "@", "-Xplugin:", "-Xep", "-proc:",
+  )
+
+  private val javaReleaseFlags =
+    Set("-source", "--source", "-target", "--target", "--release")
+  private val inlineJavaReleaseOption =
+    "(--(?:source|target|release)=)(.*)".r
+
+  private[metals] def filterJavaPcOptions(options: List[String]): List[String] =
+    clampJavaReleaseOptions(
+      options.filterNot(option =>
+        excludedJavaPcOptionPrefixes.exists(option.startsWith)
+      ),
+      Runtime.version().feature(),
+    )
+
+  private[metals] def clampJavaReleaseOptions(
+      options: List[String],
+      runtimeMajor: Int,
+  ): List[String] = {
+    val previousOptions = None :: options.map(Some(_))
+    val (clampedOptions, unsupportedVersions) =
+      options
+        .zip(previousOptions)
+        .map {
+          case (inlineJavaReleaseOption(flag, version), _) =>
+            val (clampedVersion, unsupportedVersion) =
+              clampJavaReleaseVersion(version, runtimeMajor)
+            (s"$flag$clampedVersion", unsupportedVersion)
+          case (version, Some(flag)) if javaReleaseFlags.contains(flag) =>
+            clampJavaReleaseVersion(version, runtimeMajor)
+          case (option, _) =>
+            (option, None)
+        }
+        .unzip
+
+    for (highest <- unsupportedVersions.flatten.maxOption) {
+      warnJdkVersionMismatch(highest, runtimeMajor)
+    }
+    clampedOptions
+  }
+
+  private def clampJavaReleaseVersion(
+      version: String,
+      runtimeMajor: Int,
+  ): (String, Option[Int]) =
+    JdkVersion.parse(version) match {
+      case Some(jdkVersion) if jdkVersion.major > runtimeMajor =>
+        (runtimeMajor.toString(), Some(jdkVersion.major))
+      case _ =>
+        (version, None)
+    }
+
+  private def warnJdkVersionMismatch(
+      projectJdk: Int,
+      metalsJdk: Int,
+  ): Unit =
+    scribe.warn(
+      s"""|Your project uses JDK version $projectJdk and
+          |Metals server is running on JDK version $metalsJdk.
+          |This might cause incorrect completions, since
+          |Metals JDK version should be greater than or equal to the project's JDK version.
+          |""".stripMargin
+    )
 }

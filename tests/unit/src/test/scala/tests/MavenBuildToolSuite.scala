@@ -12,7 +12,7 @@ import scala.meta.internal.builds.ShellRunner
 import scala.meta.internal.metals.EmptyWorkDoneProgress
 import scala.meta.internal.metals.MetalsEnrichments._
 import scala.meta.internal.metals.Time
-import scala.meta.internal.metals.UserConfiguration
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.metals.mbt.MbtTarget
 import scala.meta.io.AbsolutePath
 
@@ -127,19 +127,21 @@ class MavenBuildToolSuite extends BaseSuite {
     )
 
     assertEquals(
-      Await.result(
-        mavenBuildTool(workspace).mbtTestCommand(
-          workspace,
-          mbtTarget(
-            "com.example:app:1.0.0",
-            "app/target/test-classes",
-            projectDir = Some(workspace.resolve("app")),
+      Await
+        .result(
+          mavenBuildTool(workspace).mbtTestCommand(
+            workspace,
+            mbtTarget(
+              "com.example:app:1.0.0",
+              "app/target/test-classes",
+              projectDir = Some(workspace.resolve("app")),
+            ),
+            testSuites,
+            Nil,
           ),
-          testSuites,
-          Nil,
-        ),
-        Duration.Inf,
-      ),
+          Duration.Inf,
+        )
+        .arguments,
       List(
         "mvn",
         "-f",

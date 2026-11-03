@@ -4,6 +4,7 @@ import scala.collection.concurrent.TrieMap
 import scala.collection.mutable
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
+import scala.util.control.NonFatal
 
 import scala.meta.internal.implementation.TextDocumentWithPath
 import scala.meta.internal.metals.BaseCommand
@@ -17,13 +18,14 @@ import scala.meta.internal.metals.MetalsEnrichments._
 import scala.meta.internal.metals.ScalaTestSuiteSelection
 import scala.meta.internal.metals.ScalaTestSuites
 import scala.meta.internal.metals.SemanticdbFeatureProvider
-import scala.meta.internal.metals.TestUserInterfaceKind
-import scala.meta.internal.metals.UserConfiguration
 import scala.meta.internal.metals.WorkDoneProgress
 import scala.meta.internal.metals.clients.language.MetalsLanguageClient
 import scala.meta.internal.metals.codelenses.CodeLens
+import scala.meta.internal.metals.config.TestUserInterfaceKind
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.metals.debug.BuildTargetClasses
 import scala.meta.internal.metals.debug.TestFrameworkUtils
+import scala.meta.internal.metals.mbt.MbtReferenceProvider
 import scala.meta.internal.metals.testProvider.TestExplorerEvent._
 import scala.meta.internal.metals.testProvider.frameworks.JunitTestFinder
 import scala.meta.internal.metals.testProvider.frameworks.MunitTestFinder
@@ -59,19 +61,40 @@ final class TestSuitesProvider(
     folderName: String,
     folderUri: AbsolutePath,
     workDoneProgress: WorkDoneProgress,
+    mbtReferenceProvider: () => MbtReferenceProvider,
 )(implicit ec: ExecutionContext)
     extends SemanticdbFeatureProvider
     with CodeLens {
 
   private val index = new TestSuitesIndex
+
+  /**
+   * SemanticDB of a file defining a parent of a test suite. MBT doesn't write
+   * SemanticDB files to disk, so for MBT sources it's generated on demand
+   * by [[MbtReferenceProvider]] (which also caches them).
+   */
+  private def parentTextDocument(path: AbsolutePath): Option[TextDocument] =
+    try {
+      Some(mbtReferenceProvider().textDocument(path))
+        .filter(_.symbols.nonEmpty)
+    } catch {
+      case NonFatal(e) =>
+        scribe.warn(s"Failed to generate semanticdb for $path", e)
+        None
+    }
+
   private val junitTestFinder = new JunitTestFinder
   private val testNGTestFinder = new TestNGTestFinder
   private val munitTestFinder =
-    new MunitTestFinder(trees, symbolIndex, semanticdbs)
+    new MunitTestFinder(trees, symbolIndex, parentTextDocument)
   private val scalatestTestFinder =
-    new ScalatestTestFinder(trees, symbolIndex, semanticdbs)
+    new ScalatestTestFinder(trees, symbolIndex, parentTextDocument)
   private val weaverCatsEffect =
-    new WeaverCatsEffectTestFinder(trees, symbolIndex, semanticdbs)
+    new WeaverCatsEffectTestFinder(
+      trees,
+      symbolIndex,
+      parentTextDocument,
+    )
   private val zioTestFinder = new ZioTestFinder(trees)
 
   private def isExplorerEnabled = clientConfig.isTestExplorerProvider() &&
@@ -88,11 +111,23 @@ final class TestSuitesProvider(
   val refreshTestSuites: BatchedFunction[Unit, Unit] =
     BatchedFunction.fromFuture(
       { _ =>
-        if (isSuiteRefreshEnabled) doRefreshTestSuites()
-        else Future.unit
+        if (isSuiteRefreshEnabled) {
+          Future
+            .traverse(buffers.open.toSeq)(confirmMbtTestClassCandidates)
+            .flatMap(_ => doRefreshTestSuites())
+        } else Future.unit
       },
       "refreshTestSuites",
     )
+
+  private def confirmMbtTestClassCandidates(
+      path: AbsolutePath
+  ): Future[Unit] =
+    Future
+      .traverse(buildTargets.inverseSourcesAll(path)) { targetId =>
+        buildTargetClasses.confirmMbtTestClassCandidates(path, targetId)
+      }
+      .map(_ => ())
 
   private val updateTestCases
       : BatchedFunction[(AbsolutePath, TextDocument), Unit] =
@@ -193,11 +228,7 @@ final class TestSuitesProvider(
   private def discoverMbtTestsForPath(
       path: AbsolutePath
   ): Future[Unit] = {
-    val targetIds = buildTargets.inverseSourcesAll(path)
-    val confirmFutures = targetIds.map { targetId =>
-      buildTargetClasses.confirmMbtTestClassCandidates(path, targetId)
-    }
-    Future.sequence(confirmFutures).flatMap(_ => doRefreshTestSuites())
+    confirmMbtTestClassCandidates(path).flatMap(_ => doRefreshTestSuites())
   }
 
   /**
@@ -343,16 +374,18 @@ final class TestSuitesProvider(
     val buildTargetUpdates =
       for {
         metadata <- index.getMetadata(path).toList
-        events = {
-          val suites = metadata.entries.map(_.suiteDetails).distinct
-          val canResolve = suites.exists(suite =>
-            TestFrameworkUtils.canResolveTests(suite.framework)
-          )
-          if (canResolve) getTestCasesForSuites(path, suites, textDocument)
-          else Seq.empty
-        }
-        buildTarget <- metadata.entries.map(_.buildTarget).distinct
+        (buildTarget, entriesForTarget) <- metadata.entries
+          .groupBy(_.buildTarget)
+          .toList
       } yield {
+        val suites = entriesForTarget.map(_.suiteDetails).distinct
+        val canResolve = suites.exists(suite =>
+          TestFrameworkUtils.canResolveTests(suite.framework)
+        )
+        val events =
+          if (canResolve)
+            getTestCasesForSuites(path, buildTarget, suites, textDocument)
+          else Seq.empty
         buildTargetUpdate(buildTarget, events)
       }
     buildTargetUpdates
@@ -368,6 +401,7 @@ final class TestSuitesProvider(
    */
   private def getTestCasesForSuites(
       path: AbsolutePath,
+      buildTarget: BuildTarget,
       suites: Seq[TestSuiteDetails],
       doc: Option[TextDocument],
   ): Seq[AddTestCases] = {
@@ -423,6 +457,11 @@ final class TestSuitesProvider(
 
           if (testCases.nonEmpty) {
             index.updateFileMetadata(path, semanticdb.md5)
+            index.putTestCases(
+              buildTarget,
+              suite.fullyQualifiedName,
+              testCases.toList,
+            )
             val event = AddTestCases(
               fullyQualifiedClassName = suite.fullyQualifiedName.value,
               className = suite.className.value,
@@ -470,7 +509,12 @@ final class TestSuitesProvider(
           val canResolve =
             TestFrameworkUtils.canResolveTests(entry.suiteDetails.framework)
           if (canResolve && buffers.contains(entry.path))
-            getTestCasesForSuites(entry.path, Vector(entry.suiteDetails), None)
+            getTestCasesForSuites(
+              entry.path,
+              entry.buildTarget,
+              Vector(entry.suiteDetails),
+              None,
+            )
           else Nil
         }
       }.toMap
@@ -652,5 +696,16 @@ final class TestSuitesProvider(
   ): Option[TestEntry] = {
     index.get(target, FullyQualifiedName(className))
   }
+
+  def knownTestCaseNames(
+      id: b.BuildTargetIdentifier,
+      className: String,
+  ): List[String] =
+    buildTargets
+      .info(id)
+      .map(target =>
+        index.getTestCaseNames(target, FullyQualifiedName(className))
+      )
+      .getOrElse(Nil)
 
 }

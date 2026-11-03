@@ -38,16 +38,28 @@ class MbtSemanticdbTextDocumentsSuite
       assertEquals(documents.size, 2)
       assertEquals(
         documents.map(_.uri).toSet,
-        Set(server.toPath(api).toURI.toString, server.toPath(main).toURI.toString),
+        Set(
+          server.toPath(api).toURI.toString,
+          server.toPath(main).toURI.toString,
+        ),
       )
-      val definitionSymbols = documents.flatMap(_.occurrences.asScala).collect {
-        case occurrence if occurrence.role == "DEFINITION" => occurrence.symbol
-      }.toSet
-      val referenceSymbols = documents.flatMap(_.occurrences.asScala).collect {
-        case occurrence if occurrence.role == "REFERENCE" => occurrence.symbol
-      }.toSet
+      val definitionSymbols = documents
+        .flatMap(_.occurrences.asScala)
+        .collect {
+          case occurrence if occurrence.role == "DEFINITION" =>
+            occurrence.symbol
+        }
+        .toSet
+      val referenceSymbols = documents
+        .flatMap(_.occurrences.asScala)
+        .collect {
+          case occurrence if occurrence.role == "REFERENCE" => occurrence.symbol
+        }
+        .toSet
       assert(
-        definitionSymbols.intersect(referenceSymbols).exists(_.contains("answer")),
+        definitionSymbols
+          .intersect(referenceSymbols)
+          .exists(_.contains("answer")),
         clues(definitionSymbols, referenceSymbols),
       )
       assert(

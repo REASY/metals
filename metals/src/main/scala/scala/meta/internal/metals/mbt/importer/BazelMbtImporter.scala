@@ -1,8 +1,5 @@
 package scala.meta.internal.metals.mbt.importer
 
-import java.nio.file.Files
-import java.nio.file.Path
-
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 
@@ -12,11 +9,13 @@ import scala.meta.internal.builds.BazelProjectViewTargets
 import scala.meta.internal.builds.ShellRunner
 import scala.meta.internal.metals.Messages
 import scala.meta.internal.metals.MetalsEnrichments._
+import scala.meta.internal.metals.MetalsServerConfig
 import scala.meta.internal.metals.Tables
-import scala.meta.internal.metals.UserConfiguration
 import scala.meta.internal.metals.clients.language.MetalsLanguageClient
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.metals.mbt.MbtBuild
 import scala.meta.internal.metals.mbt.MbtDependencyModule
+import scala.meta.internal.metals.mbt.MbtWorkspaceSymbolProvider
 import scala.meta.internal.process.ExitCodes
 import scala.meta.internal.process.ProcessOutput
 import scala.meta.io.AbsolutePath
@@ -30,8 +29,10 @@ abstract class BazelMbtImporter(
     val projectRoot: AbsolutePath,
     shellRunner: ShellRunner,
     userConfig: () => UserConfiguration,
+    metalsServerConfig: MetalsServerConfig,
     languageClient: Option[MetalsLanguageClient] = None,
     tables: Option[Tables] = None,
+    mbtWorkspaceSymbolProvider: Option[MbtWorkspaceSymbolProvider] = None,
 )(implicit ec: ExecutionContext)
     extends MbtImportProvider {
 
@@ -48,27 +49,11 @@ abstract class BazelMbtImporter(
       namespaceMode: BazelMbtNamespaceMode,
   ): Future[Unit] = {
     val out = outputPath(workspace)
-    Files.createDirectories(out.toNIO.getParent)
+    out.parent.createDirectories()
     val patterns = BazelProjectViewTargets.patterns(projectRoot)
     for {
       outputBase <- queryOutputBase()
       bazelBin <- queryBazelBin()
-      mavenHubs = BazelMavenJsonImporter
-        .discoverMavenHubs(
-          BazelMavenJsonImporter.externalDirs(
-            projectRoot,
-            outputBase.map(AbsolutePath.apply),
-          )
-        )
-      _ = scribe.info(
-        s"bazel-mbt: found maven hubs: ${mavenHubs.map(_.name.value).mkString(", ")}"
-      )
-      mavenImportStart = System.nanoTime()
-      dependencyModules = BazelMavenJsonImporter
-        .importMaven(projectRoot, outputBase, mavenHubs)
-      _ = scribe.debug(
-        s"bazel-mbt: importMaven took ${(System.nanoTime() - mavenImportStart) / 1_000_000}ms"
-      )
       ruleKindsQueryOutput <- BazelQuery
         .buildRuleKindsQuery(patterns)
         .run(queryEnv)
@@ -80,7 +65,9 @@ abstract class BazelMbtImporter(
       targetsXmlDump = new BazelTargetsXmlDump(targetsXmlQueryOutput)
       srcs = targetsXmlDump.getLabels("srcs")
       (genSrcOutputsByTarget, genSrcLabels) <-
-        if (userConfig().mbtConfig.importGeneratedSources)
+        if (
+          userConfig().mbt.importGeneratedSources || metalsServerConfig.importGeneratedSourcesMbt
+        )
           queryGenSrcOutputsByTarget(srcs)
         else
           Future.successful(
@@ -98,6 +85,13 @@ abstract class BazelMbtImporter(
             .exists(isRunnableRule)
         )
         .toSet
+      testTargets = targets
+        .filter(target =>
+          targetsXmlDump.ruleClassesByTarget
+            .get(target)
+            .exists(isTestRule)
+        )
+        .toSet
       classDirectories = classDirectoriesForRunTargets(
         bazelBin,
         runTargets,
@@ -108,6 +102,35 @@ abstract class BazelMbtImporter(
       reachableLabelsByTarget = targetsXmlDump.reachableLabels(targets)
       externalDeps =
         targetsXmlDump.externalDepsByTarget(reachableLabelsByTarget)
+      // Materialize the external repositories before the Maven lock file is
+      // matched against `external/`; on a cold output base the jars of a
+      // pinned rules_jvm_external hub do not exist until Bazel fetches them.
+      _ <- BazelFetch.externalDependencies(
+        externalDeps.values.flatten.toSet,
+        queryEnv,
+      )
+      mavenHubs = BazelMavenJsonImporter
+        .discoverMavenHubs(
+          BazelMavenJsonImporter.externalDirs(
+            projectRoot,
+            outputBase,
+          )
+        )
+      _ = scribe.info(
+        s"bazel-mbt: found maven hubs: ${mavenHubs.map(_.name.value).mkString(", ")}"
+      )
+      mavenImportStart = System.nanoTime()
+      dependencyModules = BazelMavenJsonImporter
+        .importMaven(projectRoot, outputBase, mavenHubs)
+      _ = scribe.debug(
+        s"bazel-mbt: importMaven took ${(System.nanoTime() - mavenImportStart) / 1_000_000}ms"
+      )
+      _ =
+        if (dependencyModules.isEmpty && externalDeps.values.exists(_.nonEmpty))
+          scribe.warn(
+            "bazel-mbt: targets depend on external artifacts but no Maven dependency module was resolved; " +
+              "check that the rules_jvm_external lock file is pinned and that `bazel fetch` succeeded"
+          )
       externalDepModules = BazelMavenJsonImporter.matchExternalDeps(
         externalDeps,
         dependencyModules,
@@ -138,11 +161,20 @@ abstract class BazelMbtImporter(
         externalDepModules,
         importDepModules,
       )
-      scalaVersionFromDeps <- queryScalaVersionFromDeps()
-      effectiveScalaVersion <- scalaVersionFromDeps match {
-        case Some(value) => Future.successful(Some(value))
-        case None => queryScalaVersion(targets)
-      }
+      scalaVersions = targetsXmlDump.getStrings("scala_version")
+      effectiveScalaVersion <- BazelScalaVersionResolver.resolve(
+        queryEnv,
+        outputBase,
+        allDependencyModules,
+        scalaVersions,
+        userConfig(),
+      )
+      scalaVersionByTarget = targets.map { target =>
+        target -> scalaVersions
+          .get(target)
+          .flatMap(BazelScalaVersionResolver.maxVersion)
+          .orElse(effectiveScalaVersion)
+      }.toMap
       build = BazelMbtBuildSupport.fromDiscovery(
         namespaceMode,
         targets,
@@ -154,10 +186,13 @@ abstract class BazelMbtImporter(
         runTargets,
         classDirectories,
         allDependencyModules,
-        effectiveScalaVersion,
+        scalaVersionByTarget,
         genSrcOutputsByTarget,
+        testTargets,
+        mbtWorkspaceSymbolProvider,
+        mainClassAttrByTarget = targetsXmlDump.getStrings("main_class"),
       )
-      _ <- Future(Files.writeString(out.toNIO, MbtBuild.toJson(build)))
+      _ <- Future(out.writeText(MbtBuild.toJson(build)))
     } yield ()
   }
 
@@ -165,11 +200,16 @@ abstract class BazelMbtImporter(
     output.linesIterator.map(_.trim).filter(_.nonEmpty).toList
 
   private def isRunnableRule(ruleClass: String): Boolean =
-    ruleClass == "scala_binary" || ruleClass == "java_binary" ||
-      ruleClass == "scala_test" || ruleClass == "java_test"
+    ruleClass == "scala_binary" || ruleClass == "java_binary" || isTestRule(
+      ruleClass
+    )
+
+  // Try to include all the rules seen in the wild.
+  private def isTestRule(ruleClass: String): Boolean =
+    ruleClass == "scala_test" || ruleClass == "java_test" || ruleClass == "scala_integration_test"
 
   private def classDirectoriesForRunTargets(
-      bazelBin: Option[Path],
+      bazelBin: Option[AbsolutePath],
       runTargets: Set[String],
       ruleOutputsByTarget: Map[String, List[String]],
   ): Map[String, String] =
@@ -243,7 +283,7 @@ abstract class BazelMbtImporter(
   private def buildImportJarModules(
       importTargetJarLabels: Map[String, List[String]],
       sourcesJarByTarget: Map[String, Option[String]],
-      bazelBin: Option[Path],
+      bazelBin: Option[AbsolutePath],
   ): Seq[MbtDependencyModule] = {
     val seen = scala.collection.mutable.Set.empty[String]
     importTargetJarLabels.toSeq.sortBy(_._1).flatMap {
@@ -327,15 +367,15 @@ abstract class BazelMbtImporter(
 
   private def resolveJarUri(
       label: String,
-      bazelBin: Option[Path],
+      bazelBin: Option[AbsolutePath],
   ): Option[String] = {
     BazelLabels.fileLabelToWorkspaceRelativePath(label).flatMap { relative =>
       val candidate = projectRoot.resolve(relative)
-      if (Files.exists(candidate.toNIO)) Some(candidate.toURI.toString)
+      if (candidate.exists) Some(candidate.toURI.toString)
       else {
         val generatedCandidate = bazelBin.map(_.resolve(relative))
-        generatedCandidate.filter(Files.exists(_)) match {
-          case Some(path) => Some(path.toUri.toString)
+        generatedCandidate.filter(_.exists) match {
+          case Some(path) => Some(path.toURI.toString)
           case None =>
             scribe.warn(
               s"bazel-mbt: could not resolve jar for label $label"
@@ -353,35 +393,6 @@ abstract class BazelMbtImporter(
     allKeys.map { key =>
       key -> maps.flatMap(_.getOrElse(key, Nil)).distinct.toList
     }.toMap
-  }
-
-  private def queryScalaVersionFromDeps(): Future[Option[String]] = for {
-    queryOutput <- BazelQuery.allScalaLibrariesQuery.run(queryEnv)
-    lines = asLines(queryOutput)
-  } yield lines.flatMap(extractScalaVersionFromLabel).headOption
-
-  private def queryScalaVersion(
-      @annotation.nowarn("msg=never used") targets: List[String]
-  ): Future[Option[String]] =
-    Future.successful(parseScalaVersionFromBuildFiles())
-
-  private def parseScalaVersionFromBuildFiles(): Option[String] = {
-    val versionPattern = """scala_version\s*=\s*["'](\d+\.\d+\.\d+)["']""".r
-    val moduleFile = projectRoot.resolve("MODULE.bazel")
-    val workspaceFile = projectRoot.resolve("WORKSPACE")
-
-    def extractFromFile(path: AbsolutePath): Option[String] =
-      if (Files.exists(path.toNIO)) {
-        val content = new String(Files.readAllBytes(path.toNIO))
-        versionPattern.findFirstMatchIn(content).map(_.group(1))
-      } else None
-
-    extractFromFile(moduleFile).orElse(extractFromFile(workspaceFile))
-  }
-
-  private def extractScalaVersionFromLabel(label: String): Option[String] = {
-    val versionPattern = """scala[_-]library[_-](\d+\.\d+\.\d+)""".r
-    versionPattern.findFirstMatchIn(label).map(_.group(1))
   }
 
   /**
@@ -442,7 +453,7 @@ abstract class BazelMbtImporter(
         .filter(ruleLabels)
         .flatMap(outputsByGenLabel.getOrElse(_, Nil))
       genPaths.foreach { genPath =>
-        if (!Files.exists(projectRoot.resolve(genPath).toNIO))
+        if (!projectRoot.resolve(genPath).exists)
           scribe.warn(
             s"bazel-mbt: generated source output for target $target does not exist on disk: $genPath"
           )
@@ -497,15 +508,15 @@ abstract class BazelMbtImporter(
       }
   }
 
-  private def queryOutputBase(): Future[Option[Path]] = {
+  private def queryOutputBase(): Future[Option[AbsolutePath]] = {
     queryBazelInfo("output_base")
   }
 
-  private def queryBazelBin(): Future[Option[Path]] = {
+  private def queryBazelBin(): Future[Option[AbsolutePath]] = {
     queryBazelInfo("bazel-bin")
   }
 
-  private def queryBazelInfo(key: String): Future[Option[Path]] = {
+  private def queryBazelInfo(key: String): Future[Option[AbsolutePath]] = {
     val buf = new StringBuilder()
     shellRunner
       .run(
@@ -521,7 +532,7 @@ abstract class BazelMbtImporter(
       .map {
         case ExitCodes.Success =>
           val output = buf.toString.trim
-          if (output.nonEmpty) Some(Path.of(output)) else None
+          if (output.nonEmpty) Some(AbsolutePath(output)) else None
         case _ => None
       }
   }

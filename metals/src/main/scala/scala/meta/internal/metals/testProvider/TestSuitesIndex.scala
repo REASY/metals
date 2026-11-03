@@ -10,6 +10,7 @@ import scala.meta.io.AbsolutePath
 
 import bloop.config.Config
 import ch.epfl.scala.bsp4j.BuildTarget
+import ch.epfl.scala.{bsp4j => b}
 import org.eclipse.{lsp4j => l}
 
 final case class FullyQualifiedName(value: String) extends AnyVal
@@ -67,27 +68,56 @@ private[testProvider] final class TestSuitesIndex {
    * That's why FullyQualifiedClassName is used as a key.
    * "a/TestSuiteName., a.TestSuiteName"
    * "a/TestSuiteName#, a.TestSuiteName"
+   *
+   * Note: Uses BuildTargetIdentifier as key instead of BuildTarget because
+   * BuildTarget from BSP4J doesn't have proper equals/hashCode for use as map keys.
    */
   private val cachedTestSuites =
     TrieMap[
-      BuildTarget,
+      b.BuildTargetIdentifier,
       TrieMap[FullyQualifiedName, TestEntry],
     ]()
   private val fileToMetadata = TrieMap[AbsolutePath, TestFileMetadata]()
 
+  /**
+   * Last known test case names per suite,
+   * as reported to the client via `AddTestCases`.
+   */
+  private val cachedTestCaseNames =
+    TrieMap[(b.BuildTargetIdentifier, FullyQualifiedName), List[String]]()
+
+  def putTestCases(
+      buildTarget: BuildTarget,
+      fullyQualifiedName: FullyQualifiedName,
+      testCases: List[TestCaseEntry],
+  ): Unit =
+    cachedTestCaseNames.put(
+      (buildTarget.getId, fullyQualifiedName),
+      testCases.map(_.name),
+    )
+
+  def getTestCaseNames(
+      buildTarget: BuildTarget,
+      fullyQualifiedName: FullyQualifiedName,
+  ): List[String] =
+    cachedTestCaseNames.getOrElse((buildTarget.getId, fullyQualifiedName), Nil)
+
   def allSuites: Vector[(BuildTarget, Iterable[TestEntry])] =
-    cachedTestSuites.mapValues(_.values).toVector
+    cachedTestSuites.toVector.flatMap { case (_, suites) =>
+      suites.values.headOption.map(entry => (entry.buildTarget, suites.values))
+    }
 
   def put(
       entry: TestEntry
   ): Unit = {
     val fullyQualifiedName = entry.suiteDetails.fullyQualifiedName
-    cachedTestSuites.get(entry.buildTarget) match {
+    val targetId = entry.buildTarget.getId
+    cachedTestSuites.get(targetId) match {
       case Some(suites) =>
         suites.put(fullyQualifiedName, entry)
       case None =>
         val suites = TrieMap(fullyQualifiedName -> entry)
-        cachedTestSuites.put(entry.buildTarget, suites)
+        cachedTestSuites.put(targetId, suites)
     }
 
     fileToMetadata.get(entry.path) match {
@@ -126,19 +156,24 @@ private[testProvider] final class TestSuitesIndex {
   def getSuiteNames(
       buildTarget: BuildTarget
   ): Set[FullyQualifiedName] =
-    cachedTestSuites.get(buildTarget).map(_.keySet.toSet).getOrElse(Set.empty)
+    cachedTestSuites
+      .get(buildTarget.getId)
+      .map(_.keySet.toSet)
+      .getOrElse(Set.empty)
 
   def get(target: BuildTarget, name: FullyQualifiedName): Option[TestEntry] =
-    cachedTestSuites.get(target).flatMap(_.get(name))
+    cachedTestSuites.get(target.getId).flatMap(_.get(name))
 
   def remove(
       buildTarget: BuildTarget,
       suiteName: FullyQualifiedName,
   ): Option[TestEntry] = {
+    val targetId = buildTarget.getId
     for {
-      suites <- cachedTestSuites.get(buildTarget)
+      suites <- cachedTestSuites.get(targetId)
       entry <- suites.remove(suiteName)
     } yield {
+      cachedTestCaseNames.remove((targetId, suiteName))
       fileToMetadata.get(entry.path).foreach { metadata =>
         val filtered =
           metadata.entries

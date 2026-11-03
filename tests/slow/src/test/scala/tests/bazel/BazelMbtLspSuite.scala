@@ -3,13 +3,14 @@ package tests.bazel
 import scala.concurrent.duration._
 
 import scala.meta.internal.builds.ShellRunner
-import scala.meta.internal.metals.AutoImportBuildKind
-import scala.meta.internal.metals.Configs.JavaSymbolLoaderConfig
-import scala.meta.internal.metals.Configs.ReferenceProviderConfig
-import scala.meta.internal.metals.Configs.WorkspaceSymbolProviderConfig
+import scala.meta.internal.metals.InitializationOptions
 import scala.meta.internal.metals.Messages
 import scala.meta.internal.metals.MetalsEnrichments._
-import scala.meta.internal.metals.UserConfiguration
+import scala.meta.internal.metals.config.AutoImportBuildKind
+import scala.meta.internal.metals.config.JavaSymbolLoaderConfig
+import scala.meta.internal.metals.config.ReferenceProviderConfig
+import scala.meta.internal.metals.config.UserConfiguration
+import scala.meta.internal.metals.config.WorkspaceSymbolProviderConfig
 import scala.meta.internal.metals.mbt.MbtBuildServer
 import scala.meta.internal.metals.{BuildInfo => V}
 import scala.meta.io.AbsolutePath
@@ -20,6 +21,7 @@ import tests.BazelBuildLayout
 import tests.MbtTestInitializer
 import tests.ScriptsAssertions
 import tests.TestHovers
+import tests.TestingServer
 
 /**
  * End-to-end: Bazel workspace → MBT import (`bazel query` + `.metals/mbt.json`)
@@ -33,6 +35,9 @@ class BazelMbtLspSuite
 
   private val bazelVersion = "8.2.1"
 
+  override protected def initializationOptions: Option[InitializationOptions] =
+    Some(TestingServer.TestDefault.copy(testExplorerProvider = Some(true)))
+
   override def userConfig: UserConfiguration =
     super.userConfig.copy(
       fallbackScalaVersion = Some(
@@ -41,11 +46,11 @@ class BazelMbtLspSuite
       presentationCompilerDiagnostics = true,
       buildOnChange = false,
       buildOnFocus = false,
-      workspaceSymbolProvider = WorkspaceSymbolProviderConfig.mbt,
-      javaSymbolLoader = JavaSymbolLoaderConfig.turbineClasspath,
-      referenceProvider = ReferenceProviderConfig.mbt,
+      workspaceSymbolProvider = WorkspaceSymbolProviderConfig.MBT,
+      javaSymbolLoader = JavaSymbolLoaderConfig.TurbineClasspath,
+      referenceProvider = ReferenceProviderConfig.MBT,
       preferredBuildServer = Some(MbtBuildServer.name),
-      automaticImportBuild = AutoImportBuildKind.All,
+      autoImportBuilds = AutoImportBuildKind.All,
     )
 
   override def initializeGitRepo: Boolean = true
@@ -133,7 +138,7 @@ class BazelMbtLspSuite
        |        "org.typelevel:cats-core_2.13:2.13.0",
        |        "org.typelevel:cats-kernel_2.13:2.13.0"
        |      ],
-       |      "scalaVersion": "2.13.16",
+       |      "scalaVersion": "2.13.18",
        |      "dependsOn": [],
        |      "classDirectories": []
        |    }
@@ -338,6 +343,55 @@ class BazelMbtLspSuite
     projectView + coreA + coreB
   }
 
+  private def mixedScalaVersionsLayout: String =
+    s"""|/.bazelproject
+        |targets:
+        |    //...
+        |
+        |/MODULE.bazel
+        |bazel_dep(name = "rules_scala", version = "7.2.4")
+        |
+        |scala_config = use_extension("@rules_scala//scala/extensions:config.bzl", "scala_config")
+        |scala_config.settings(
+        |    scala_version = "${V.scala213}",
+        |    scala_versions = ["${V.scala213}", "${V.scala3}"],
+        |)
+        |
+        |scala_deps = use_extension("@rules_scala//scala/extensions:deps.bzl", "scala_deps")
+        |scala_deps.settings(fetch_sources = True)
+        |scala_deps.scala()
+        |use_repo(scala_deps, "rules_scala_toolchains")
+        |
+        |register_toolchains("@rules_scala_toolchains//...:all")
+        |
+        |/lib2/BUILD
+        |load("@rules_scala//scala:scala.bzl", "scala_library")
+        |
+        |scala_library(
+        |    name = "lib2",
+        |    srcs = ["Lib2.scala"],
+        |)
+        |
+        |/lib2/Lib2.scala
+        |package lib2
+        |
+        |class Lib2
+        |
+        |/lib3/BUILD
+        |load("@rules_scala//scala:scala.bzl", "scala_library")
+        |
+        |scala_library(
+        |    name = "lib3",
+        |    srcs = ["Lib3.scala"],
+        |    scala_version = "${V.scala3}",
+        |)
+        |
+        |/lib3/Lib3.scala
+        |package lib3
+        |
+        |class Lib3
+        |""".stripMargin
+
   private def pinHubs(hubNames: List[String])(workspace: AbsolutePath): Unit = {
     for (hubName <- hubNames)
       workspace.resolve(s"${hubName}_install.json").touch()
@@ -421,7 +475,7 @@ class BazelMbtLspSuite
             |        "org.typelevel:cats-core_2.13:2.12.0",
             |        "org.typelevel:cats-kernel_2.13:2.12.0"
             |      ],
-            |      "scalaVersion": "2.13.14",
+            |      "scalaVersion": "2.13.18",
             |      "dependsOn": [],
             |      "classDirectories": []
             |    },
@@ -436,7 +490,7 @@ class BazelMbtLspSuite
             |        "org.typelevel:cats-core_2.13:2.13.0",
             |        "org.typelevel:cats-kernel_2.13:2.13.0"
             |      ],
-            |      "scalaVersion": "2.13.14",
+            |      "scalaVersion": "2.13.18",
             |      "dependsOn": [],
             |      "classDirectories": []
             |    }
@@ -497,7 +551,7 @@ class BazelMbtLspSuite
             |        "org.typelevel:cats-core_2.13:2.13.0",
             |        "org.typelevel:cats-kernel_2.13:2.13.0"
             |      ],
-            |      "scalaVersion": "2.13.16",
+            |      "scalaVersion": "2.13.18",
             |      "dependsOn": [],
             |      "classDirectories": []
             |    },
@@ -513,13 +567,19 @@ class BazelMbtLspSuite
             |        "org.typelevel:cats-core_2.13:2.13.0",
             |        "org.typelevel:cats-kernel_2.13:2.13.0"
             |      ],
-            |      "scalaVersion": "2.13.16",
+            |      "scalaVersion": "2.13.18",
             |      "dependsOn": [
             |        "//core"
             |      ],
             |      "classDirectories": ["<classDirectories-path>"],
             |      "configurations": [
             |        "//app:hello"
+            |      ],
+            |      "mainClasses": [
+            |        {
+            |          "className": "main",
+            |          "configuration": "//app:hello"
+            |        }
             |      ]
             |    }
             |  },
@@ -741,6 +801,12 @@ class BazelMbtLspSuite
             |      "classDirectories": ["<classDirectories-path>"],
             |      "configurations": [
             |        "//app:main"
+            |      ],
+            |      "mainClasses": [
+            |        {
+            |          "className": "app.Main",
+            |          "configuration": "//app:main"
+            |        }
             |      ]
             |    }
             |  },
@@ -947,11 +1013,17 @@ class BazelMbtLspSuite
             |        "org.typelevel:cats-core_2.13:2.13.0",
             |        "org.typelevel:cats-kernel_2.13:2.13.0"
             |      ],
-            |      "scalaVersion": "2.13.16",
+            |      "scalaVersion": "2.13.18",
             |      "dependsOn": [],
             |      "classDirectories": ["<classDirectories-path>"],
             |      "configurations": [
             |        "//app:hello"
+            |      ],
+            |      "mainClasses": [
+            |        {
+            |          "className": "main",
+            |          "configuration": "//app:hello"
+            |        }
             |      ]
             |    }
             |  },
@@ -1051,6 +1123,12 @@ class BazelMbtLspSuite
             |      "classDirectories": ["<classDirectories-path>"],
             |      "configurations": [
             |        "//app:app"
+            |      ],
+            |      "mainClasses": [
+            |        {
+            |          "className": "app.Main",
+            |          "configuration": "//app:app"
+            |        }
             |      ]
             |    }
             |  },
@@ -1097,6 +1175,75 @@ class BazelMbtLspSuite
     } yield ()
   }
 
+  /**
+   * A `scala_test` whose sources live under `src/test/scala/...` while the
+   * declared package is `example`. Path-as-package would export
+   * `src.test.scala.example.FooSpec`; import must strip the source root and
+   * expose `example.FooSpec`.
+   */
+  private def srcTestPackageMismatchLayout: String =
+    """|/.bazelproject
+       |targets:
+       |    //...
+       |
+       |/src/test/BUILD
+       |load("@rules_scala//scala:scala.bzl", "scala_test")
+       |
+       |scala_test(
+       |    name = "FooSpec",
+       |    srcs = ["scala/example/inner/FooSpec.scala"],
+       |    deps = ["@maven//:org_scalatest_scalatest_2_13"],
+       |)
+       |
+       |/src/test/scala/example/inner/FooSpec.scala
+       |package example
+       |
+       |import org.scalatest.funsuite.AnyFunSuite
+       |
+       |class FooSpec extends AnyFunSuite {
+       |  test("ok") { assert(true) }
+       |}
+       |""".stripMargin
+
+  test("bazel-import-mbt-src-test-package-mismatch") {
+    client.selectedServer = Messages.ChooseBuildServer.mbt
+    cleanWorkspace()
+    val testFile = "src/test/scala/example/inner/FooSpec.scala"
+    for {
+      _ <- initialize(
+        BazelBuildLayout(
+          srcTestPackageMismatchLayout,
+          V.scala213,
+          bazelVersion,
+          List("org.scalatest:scalatest_2.13:3.2.19"),
+          includeScalatest = true,
+        ),
+        runAdditionalCommands = pinMaven,
+      )
+      _ <- server.headServer.connectionProvider.buildServerPromise.future
+      mbtFile = workspace.resolve(".metals/mbt.json").readText
+      escaped = escapeMbtFile(mbtFile)
+      _ = {
+        assert(
+          escaped.contains(""""className": "example.FooSpec""""),
+          s"expected test class from declared package, got:\n$escaped",
+        )
+        assert(
+          !escaped.contains("src.test.scala"),
+          s"test class name must not include src/test/scala path segments:\n$escaped",
+        )
+      }
+      _ <- server.didOpen(testFile)
+      testSuites <- server.discoverTestSuites(List(testFile))
+    } yield {
+      val testEvents = testSuites.flatMap(_.events.toArray.toSeq)
+      assert(
+        testEvents.exists(_.toString.contains("example.FooSpec")),
+        s"Expected to expose example.FooSpec from src/test, got: ${testEvents.mkString(", ")}",
+      )
+    }
+  }
+
   test("bazel-import-mbt-custom-maven-hub") {
     val hub = "custom_maven"
     client.selectedServer = Messages.ChooseBuildServer.mbt
@@ -1117,6 +1264,142 @@ class BazelMbtLspSuite
       // Identical to the single-target result: the hub name
       // does not appear in the imported model.
       _ = assertNoDiff(escapeMbtFile(mbtFile), singleCoreMbtJson)
+    } yield ()
+  }
+
+  private val globSrcsLayout =
+    """|/src/test/BUILD
+       |load("@rules_scala//scala:scala.bzl", "scala_test")
+       |
+       |scala_test(
+       |    name = "foo",
+       |    srcs = glob(["scala/**/*.scala"]),
+       |    visibility = ["//visibility:public"],
+       |)
+       |/src/test/scala/foo/FooTest.scala
+       |package foo
+       |class FooTest
+       |/src/test/scala/bar/BarTest.scala
+       |package bar
+       |class BarTest
+       |""".stripMargin
+
+  test("bazel-import-test-glob-files") {
+
+    client.selectedServer = Messages.ChooseBuildServer.mbt
+    cleanWorkspace()
+    client.chooseBazelMbtNamespaceMode =
+      Messages.BazelMbtNamespaceChoice.packages
+    for {
+      _ <- initialize(
+        BazelBuildLayout(
+          globSrcsLayout,
+          V.scala213,
+          bazelVersion,
+          mavenDeps,
+        ),
+        runAdditionalCommands = pinMaven,
+      )
+      _ <- server.headServer.connectionProvider.buildServerPromise.future
+      mbtFile = workspace.resolve(".metals/mbt.json").readText
+      _ = assertContains(
+        client.workspaceMessageRequests,
+        Messages.BazelMbtNamespaceChoice.params().getMessage(),
+      )
+      _ = assertNoDiff(
+        escapeMbtFile(mbtFile),
+        s"""|{
+            |  "dependencyModules": [
+            |    {
+            |      "id": "org.scala-lang:scala-library:2.13.16",
+            |      "jar": "<jar-path>",
+            |      "sources": "<sources-path>"
+            |    },
+            |    {
+            |      "id": "org.typelevel:cats-core_2.13:2.13.0",
+            |      "jar": "<jar-path>",
+            |      "sources": "<sources-path>"
+            |    },
+            |    {
+            |      "id": "org.typelevel:cats-kernel_2.13:2.13.0",
+            |      "jar": "<jar-path>",
+            |      "sources": "<sources-path>"
+            |    }
+            |  ],
+            |  "namespaces": {
+            |    "//src/test": {
+            |      "sources": [
+            |        "src/test/scala/bar/BarTest.scala",
+            |        "src/test/scala/foo/FooTest.scala"
+            |      ],
+            |      "scalacOptions": [],
+            |      "javacOptions": [],
+            |      "dependencyModules": [],
+            |      "scalaVersion": "2.13.18",
+            |      "dependsOn": [],
+            |      "classDirectories": ["<classDirectories-path>"],
+            |      "configurations": [
+            |        "//src/test:foo"
+            |      ],
+            |      "testClasses": [
+            |        {
+            |          "className": "bar.BarTest",
+            |          "sourcePath": "src/test/scala/bar/BarTest.scala",
+            |          "configuration": "//src/test:foo"
+            |        },
+            |        {
+            |          "className": "foo.FooTest",
+            |          "sourcePath": "src/test/scala/foo/FooTest.scala",
+            |          "configuration": "//src/test:foo"
+            |        }
+            |      ]
+            |    }
+            |  },
+            |  "uncheckedSources": []
+            |}""".stripMargin,
+      )
+    } yield ()
+  }
+
+  test("bazel-import-mbt-mixed-scala-versions") {
+    cleanWorkspace()
+    for {
+      _ <- initialize(
+        BazelBuildLayout(mixedScalaVersionsLayout, V.scala213, bazelVersion)
+      )
+      _ <- server.headServer.connectionProvider.buildServerPromise.future
+      mbtFile = workspace.resolve(".metals/mbt.json").readText
+      _ = assertNoDiff(
+        escapeMbtFile(mbtFile),
+        s"""|{
+            |  "dependencyModules": [],
+            |  "namespaces": {
+            |    "//lib2": {
+            |      "sources": [
+            |        "lib2/Lib2.scala"
+            |      ],
+            |      "scalacOptions": [],
+            |      "javacOptions": [],
+            |      "dependencyModules": [],
+            |      "scalaVersion": "${V.scala213}",
+            |      "dependsOn": [],
+            |      "classDirectories": []
+            |    },
+            |    "//lib3": {
+            |      "sources": [
+            |        "lib3/Lib3.scala"
+            |      ],
+            |      "scalacOptions": [],
+            |      "javacOptions": [],
+            |      "dependencyModules": [],
+            |      "scalaVersion": "${V.scala3}",
+            |      "dependsOn": [],
+            |      "classDirectories": []
+            |    }
+            |  },
+            |  "uncheckedSources": []
+            |}""".stripMargin,
+      )
     } yield ()
   }
 

@@ -35,6 +35,7 @@ import scala.meta.internal.metals.Messages.IncompatibleBloopVersion
 import scala.meta.internal.metals.MetalsEnrichments._
 import scala.meta.internal.metals.bloop.BloopServers
 import scala.meta.internal.metals.clients.language.MetalsSyncModesParams
+import scala.meta.internal.metals.config.AutoImportBuildKind
 import scala.meta.internal.metals.doctor.Doctor
 import scala.meta.internal.metals.mbt.MbtBuild
 import scala.meta.internal.metals.mbt.MbtBuildServer
@@ -466,7 +467,7 @@ class ConnectionProvider(
             scribe.info(s"Skipping reload with status '${status.name}'")
             Future.successful(BuildChange.None)
           case None =>
-            if (userConfig.automaticImportBuild == AutoImportBuildKind.All) {
+            if (userConfig.autoImportBuilds == AutoImportBuildKind.All) {
               reloadAndIndex(session)
             } else {
               for {
@@ -680,32 +681,11 @@ class ConnectionProvider(
         }
         _ = compilers.cancel()
         buildChange <- index(check, progress)
-        // When testing we need to make sure the classpath is refreshed after mbt.json is generated
-        _ <- {
-          if (MetalsServerConfig.isTesting)
-            refreshMbtTurbineClasspath(session).withInterrupt
-          else
-            Future {
-              refreshMbtTurbineClasspath(session)
-            }.withInterrupt
-        }
       } yield {
         syncStatusReporter.importFinished(focusedDocument.map(_.toURI.toString))
         buildChange
       }
     }
-
-    private def refreshMbtTurbineClasspath(
-        session: BspSession
-    ): Future[Unit] =
-      if (
-        MbtBuildServer.isMbtServer(session.main.name) &&
-        userConfig.javaSymbolLoader.isTurbineClasspath
-      ) {
-        mbtSymbolSearch.scheduleRecompileTurbineClasspath()
-      } else {
-        Future.unit
-      }
 
     private def saveProjectReferencesInfo(
         bspBuilds: List[BspSession.BspBuild]

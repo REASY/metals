@@ -10,7 +10,7 @@ import scala.meta.internal.ansi.AnsiFilter
 import scala.meta.internal.metals.BuildTargets
 import scala.meta.internal.metals.Compilations
 import scala.meta.internal.metals.MetalsEnrichments._
-import scala.meta.internal.metals.UserConfiguration
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.metals.debug.DebugProvider
 import scala.meta.internal.metals.debug.server.TestSuiteDebugAdapter
 import scala.meta.io.AbsolutePath
@@ -42,27 +42,33 @@ class McpTestRunner(
     }
     val cancelPromise = Promise[Unit]()
     for {
-      path <- optPath
-        .orElse(resolvePath(testClass))
-        .toRight(s"Missing path to test suite and failed to resolve it.")
+      path <- optPath match {
+        case Some(path) => Right(path)
+        case None => resolvePath(testClass)
+      }
       id <- buildTargets
         .inverseSources(path)
-        .toRight(s"Could not find build target for $path")
+        .toRight(
+          s"Could not find build target for $path, try running `import-build`."
+        )
       jvmTestEnv = debugProvider.jvmTestEnvironment(id)
       result <-
         if (debugProvider.usesBuildTargetTest(id)) {
           // Same path as non-debug editor runs for MBT: BSP buildTarget/test.
           Right {
-            jvmTestEnv.flatMap { env =>
-              val testSuites = createTestSuites(testSelection, env)
-              debugProvider.runBuildTargetTest(
-                id,
-                testSuites,
-                cancelPromise,
-                verbose,
-              ) match {
-                case Right(future) => future.map(output => AnsiFilter()(output))
-                case Left(error) => Future.successful(error)
+            debugProvider.confirmMbtTestClassCandidates(path, id).flatMap { _ =>
+              jvmTestEnv.flatMap { env =>
+                val testSuites = createTestSuites(testSelection, env)
+                debugProvider.runBuildTargetTest(
+                  id,
+                  testSuites,
+                  cancelPromise,
+                  verbose,
+                ) match {
+                  case Right(future) =>
+                    future.map(output => AnsiFilter()(output))
+                  case Left(error) => Future.successful(error)
+                }
               }
             }
           }
@@ -126,8 +132,15 @@ class McpTestRunner(
     }
   }
 
-  private def resolvePath(fqcn: String): Option[AbsolutePath] = {
-    mcpSearch.exactSearch(fqcn, None).flatMap(_.definitionPath).headOption
+  private def resolvePath(fqcn: String): Either[String, AbsolutePath] = {
+    mcpSearch
+      .exactSearchAllTargets(fqcn)
+      .flatMap(_.definitionPath)
+      .distinct match {
+      case Seq(path) => Right(path)
+      case Nil => Left("Missing path to test suite and failed to resolve it.")
+      case _ => Left(s"Multiple test suites found for $fqcn. Provide testFile.")
+    }
   }
 }
 

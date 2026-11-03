@@ -24,6 +24,8 @@ import scala.meta.internal.builds.ShellRunner
 import scala.meta.internal.metals.MetalsEnrichments._
 import scala.meta.internal.metals.bloop.BloopServers
 import scala.meta.internal.metals.clients.language.ConfiguredLanguageClient
+import scala.meta.internal.metals.config.BuildChangedAction
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.metals.data.ResetWorkspaceState
 import scala.meta.internal.metals.doctor.HeadDoctor
 import scala.meta.internal.metals.doctor.MetalsServiceInfo
@@ -108,11 +110,16 @@ class ProjectMetalsLspService(
     folder,
     bspGlobalDirectories,
     () => userConfig,
+    serverInputs.initialServerConfig,
     () => tables.buildServers.selectedServer().nonEmpty,
     charset,
     shellRunner,
     ec,
+    Some(mbt2),
   )
+
+  override protected def discoverMbtClassesFromIndex: Boolean =
+    buildTools.discoverMbtClassesFromIndex
 
   override def indexer: Indexer = connectionProvider
   def buildServerPromise = connectionProvider.buildServerPromise
@@ -210,7 +217,8 @@ class ProjectMetalsLspService(
         buildTool = buildTool,
         userJavaHome = () => userConfig.javaHome,
         workDoneProgress = workDoneProgress,
-        classToSourceFile = buildTargetClasses.sourceFileForMbtTestClass,
+        buildTargetClasses = buildTargetClasses,
+        testProvider = testProvider,
       )(ec)
     }
 
@@ -295,6 +303,7 @@ class ProjectMetalsLspService(
       mcpSearch,
       () => mtags,
       folder,
+      initialServerConfig.maxMcpSearchResults,
     )
 
   lazy val mcpTestRunner =
@@ -467,7 +476,7 @@ class ProjectMetalsLspService(
         connectionProvider.runMbtReimport(mbtImporters)
       else
         Future.unit
-    } else if (userConfig.buildChangedAction.isNone) {
+    } else if (userConfig.buildChangedAction == BuildChangedAction.None) {
       Future.unit
     } else {
       val changedBuilds = paths.flatMap(buildTools.isBuildRelated)
@@ -861,7 +870,7 @@ class ProjectMetalsLspService(
       } else Future.successful(())
 
     def resetDecorations =
-      if (userConfig.inlayHintsOptions != old.inlayHintsOptions) {
+      if (userConfig.inlayHints != old.inlayHints) {
         languageClient.refreshInlayHints().asScala
       } else Future.successful(())
 

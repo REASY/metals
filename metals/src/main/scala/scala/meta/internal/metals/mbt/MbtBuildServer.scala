@@ -7,6 +7,7 @@ import java.nio.file.Path
 import java.nio.file.Paths
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.attribute.BasicFileAttributes
+import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.atomic.AtomicReference
 
@@ -14,6 +15,7 @@ import scala.build.bsp.WrappedSourcesResult
 import scala.collection.mutable
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
+import scala.concurrent.Promise
 import scala.jdk.CollectionConverters._
 import scala.util.Failure
 import scala.util.Success
@@ -69,8 +71,10 @@ import ch.epfl.scala.bsp4j.RunParams
 import ch.epfl.scala.bsp4j.RunProvider
 import ch.epfl.scala.bsp4j.RunResult
 import ch.epfl.scala.bsp4j.ScalaMainClass
+import ch.epfl.scala.bsp4j.ScalaMainClassesItem
 import ch.epfl.scala.bsp4j.ScalaMainClassesParams
 import ch.epfl.scala.bsp4j.ScalaMainClassesResult
+import ch.epfl.scala.bsp4j.ScalaTestClassesItem
 import ch.epfl.scala.bsp4j.ScalaTestClassesParams
 import ch.epfl.scala.bsp4j.ScalaTestClassesResult
 import ch.epfl.scala.bsp4j.ScalaTestSuiteSelection
@@ -80,6 +84,7 @@ import ch.epfl.scala.bsp4j.ScalacOptionsResult
 import ch.epfl.scala.bsp4j.SourcesParams
 import ch.epfl.scala.bsp4j.SourcesResult
 import ch.epfl.scala.bsp4j.StatusCode
+import ch.epfl.scala.bsp4j.TaskFinishParams
 import ch.epfl.scala.bsp4j.TaskId
 import ch.epfl.scala.bsp4j.TestParams
 import ch.epfl.scala.bsp4j.TestParamsDataKind
@@ -338,12 +343,14 @@ final class MbtBuildServer(
         if (targets.isEmpty) {
           result.complete(new CompileResult(StatusCode.OK))
         } else {
+          val cancel = cancellationOf(result)
           val futures = targets.map { target =>
             starter.compile(
               target,
               workspace,
               out = line => scribe.info(s"[mbt-compile] $line"),
               err = line => scribe.warn(s"[mbt-compile] $line"),
+              cancel,
             )
           }
           Future
@@ -374,7 +381,9 @@ final class MbtBuildServer(
           )
         )
       case Some(starter) =>
-        val outcome: Either[String, Future[Int]] = for {
+        val (originId, taskId) =
+          mbtInvocation(params.getOriginId, "mbt-test")
+        val outcome: Either[String, Future[MbtTestRunResult]] = for {
           testSuites <- asScalaTestSuites(params)
           target <- importedBuildTargets
             .find(_.id == params.getTargets.asScala.headOption.orNull)
@@ -385,8 +394,9 @@ final class MbtBuildServer(
           target,
           testSuites,
           workspace,
-          line => testPrint(params, "mbt-test", line, isError = false),
-          line => testPrint(params, "mbt-test", line, isError = true),
+          line => printOutput(originId, taskId, line, isError = false),
+          line => printOutput(originId, taskId, line, isError = true),
+          cancellationOf(result),
         )
 
         outcome match {
@@ -394,11 +404,18 @@ final class MbtBuildServer(
             result.completeExceptionally(new IllegalArgumentException(error))
           case Right(future) =>
             future.onComplete {
-              case Success(0) =>
-                result.complete(new TestResult(StatusCode.OK))
-              case Success(_) =>
-                result.complete(new TestResult(StatusCode.ERROR))
+              case Success(run) =>
+                val status =
+                  if (run.exitCode == 0) StatusCode.OK else StatusCode.ERROR
+                finishTask(originId, taskId, status)
+                val testResult = new TestResult(status)
+                if (run.report.testCases.nonEmpty) {
+                  testResult.setDataKind(MbtTestReport.dataKind)
+                  testResult.setData(run.report.toJson)
+                }
+                result.complete(testResult)
               case Failure(ex) =>
+                finishTask(originId, taskId, StatusCode.ERROR)
                 result.completeExceptionally(ex)
             }
         }
@@ -446,15 +463,13 @@ final class MbtBuildServer(
         )
     }
 
-  private def testPrint(
-      params: TestParams,
+  private def printOutput(
+      originId: String,
       taskId: String,
       message: String,
       isError: Boolean,
   ): Unit = {
     Option(buildClient.get()).foreach { client =>
-      val originId =
-        Option(params.getOriginId).getOrElse("metals-mbt-test")
       val printParams = new PrintParams(originId, message + "\n")
       printParams.setTask(new TaskId(taskId))
       if (isError) client.onRunPrintStderr(printParams)
@@ -474,6 +489,8 @@ final class MbtBuildServer(
           )
         )
       case Some(starter) =>
+        val (originId, taskId) =
+          mbtInvocation(params.getOriginId, "mbt-run")
         val outcome: Either[String, Future[Int]] = for {
           mainClass <- asScalaMainClass(params)
           target <- importedBuildTargets
@@ -483,8 +500,9 @@ final class MbtBuildServer(
           target,
           mainClass,
           workspace,
-          line => runPrint(params, "mbt-run", line, isError = false),
-          line => runPrint(params, "mbt-run", line, isError = true),
+          line => printOutput(originId, taskId, line, isError = false),
+          line => printOutput(originId, taskId, line, isError = true),
+          cancellationOf(result),
         )
 
         outcome match {
@@ -493,10 +511,13 @@ final class MbtBuildServer(
           case Right(future) =>
             future.onComplete {
               case Success(0) =>
+                finishTask(originId, taskId, StatusCode.OK)
                 result.complete(new RunResult(StatusCode.OK))
               case Success(_) =>
+                finishTask(originId, taskId, StatusCode.ERROR)
                 result.complete(new RunResult(StatusCode.ERROR))
               case Failure(ex) =>
+                finishTask(originId, taskId, StatusCode.ERROR)
                 result.completeExceptionally(ex)
             }
         }
@@ -518,20 +539,24 @@ final class MbtBuildServer(
         Left("buildTarget/run: expected ScalaMainClass data")
     }
 
-  private def runPrint(
-      params: RunParams,
+  private def finishTask(
+      originId: String,
       taskId: String,
-      message: String,
-      isError: Boolean,
+      status: StatusCode,
   ): Unit = {
     Option(buildClient.get()).foreach { client =>
-      val originId =
-        Option(params.getOriginId).getOrElse("metals-mbt-run")
-      val printParams = new PrintParams(originId, message + "\n")
-      printParams.setTask(new TaskId(taskId))
-      if (isError) client.onRunPrintStderr(printParams)
-      else client.onRunPrintStdout(printParams)
+      val params = new TaskFinishParams(new TaskId(taskId), status)
+      params.setOriginId(originId)
+      client.onBuildTaskFinish(params)
     }
+  }
+
+  private def mbtInvocation(
+      requestedOriginId: String,
+      taskName: String,
+  ): (String, String) = {
+    val taskId = s"$taskName-${UUID.randomUUID()}"
+    (Option(requestedOriginId).getOrElse(taskId), taskId)
   }
 
   override def buildTargetCleanCache(
@@ -573,17 +598,66 @@ final class MbtBuildServer(
 
   override def buildTargetScalaMainClasses(
       params: ScalaMainClassesParams
-  ): CompletableFuture[ScalaMainClassesResult] =
-    CompletableFuture.completedFuture(
-      new ScalaMainClassesResult(List.empty.asJava)
-    )
+  ): CompletableFuture[ScalaMainClassesResult] = {
+    val requestedTargets = params.getTargets.asScala.toSet
+    val items = importedBuildTargets
+      .filter(t => requestedTargets(t.id) && t.mainClasses.nonEmpty)
+      .map { target =>
+        new ScalaMainClassesItem(
+          target.id,
+          target.mainClasses.map { mc =>
+            new ScalaMainClass(
+              mc.className,
+              Nil.asJava,
+              Nil.asJava,
+            )
+          }.asJava,
+        )
+      }
+    CompletableFuture.completedFuture(new ScalaMainClassesResult(items.asJava))
+  }
 
   override def buildTargetScalaTestClasses(
       params: ScalaTestClassesParams
-  ): CompletableFuture[ScalaTestClassesResult] =
+  ): CompletableFuture[ScalaTestClassesResult] = try {
+    val requestedTargets = params.getTargets.asScala.toSet
+    val targetsWithTests = importedBuildTargets
+      .filter(t => requestedTargets(t.id) && t.testClasses.nonEmpty)
+    if (targetsWithTests.isEmpty) {
+      return CompletableFuture.completedFuture(
+        new ScalaTestClassesResult(List.empty.asJava)
+      )
+    }
+
+    // Verify all candidates at once, grouped by target
+    val verificationItems = targetsWithTests.map { target =>
+      val verifiedClasses =
+        MbtTestClassVerifier.verify(target.testClasses, workspace)
+      verifiedClasses
+        .groupBy(tc => Option(tc.framework))
+        .toSeq
+        .sortBy { case (framework, _) => framework.getOrElse("") }
+        .map { case (framework, classes) =>
+          val item = new ScalaTestClassesItem(
+            target.id,
+            classes.map(_.className).distinct.asJava,
+          )
+          framework.foreach(item.setFramework)
+          item
+        }
+    }.flatten
+
     CompletableFuture.completedFuture(
-      new ScalaTestClassesResult(List.empty.asJava)
+      new ScalaTestClassesResult(verificationItems.asJava)
     )
+
+  } catch {
+    case ex: Throwable =>
+      scribe.error("Error verifying test classes", ex)
+      CompletableFuture.completedFuture(
+        new ScalaTestClassesResult(List.empty.asJava)
+      )
+  }
 
   override def buildTargetDependencyModules(
       params: DependencyModulesParams
@@ -642,16 +716,22 @@ final class MbtBuildServer(
             .toRight(s"debugSessionStart: no MBT target for $targetId")
         } yield target
 
+        val cancel = cancellationOf(result)
         val outcome: Either[String, Future[URI]] = targetEither.flatMap {
           target =>
             params.asScalaMainClass() match {
               case Right(mainClass) =>
-                Right(starter.start(target, mainClass, workspace))
+                Right(starter.start(target, mainClass, workspace, cancel))
               case Left(_) =>
                 params
                   .asScalaTestSuites()
                   .map(testSuites =>
-                    starter.startDebugTest(target, testSuites, workspace)
+                    starter.startDebugTest(
+                      target,
+                      testSuites,
+                      workspace,
+                      cancel,
+                    )
                   )
             }
         }
@@ -669,6 +749,20 @@ final class MbtBuildServer(
         }
     }
     result
+  }
+
+  /**
+   * Completed when the BSP request is cancelled, so the build-tool process
+   * and its progress notification can be stopped.
+   */
+  private def cancellationOf[T](
+      result: CompletableFuture[T]
+  ): Promise[Unit] = {
+    val cancel = Promise[Unit]()
+    result.whenComplete { (_, _) =>
+      if (result.isCancelled) cancel.trySuccess(())
+    }
+    cancel
   }
 
   override def buildTargetJvmRunEnvironment(

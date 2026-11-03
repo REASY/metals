@@ -9,7 +9,7 @@ import scala.concurrent.duration.Duration
 import scala.jdk.CollectionConverters._
 
 import scala.meta.internal.builds.GradleBuildTool
-import scala.meta.internal.metals.UserConfiguration
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.metals.mbt.MbtTarget
 import scala.meta.io.AbsolutePath
 
@@ -154,18 +154,18 @@ class GradleBuildToolSuite extends BaseSuite {
     )
 
     val command =
-      Await.result(
-        gradleBuildTool(workspace)
-          .mbtTestCommand(
-            workspace,
-            mbtTarget("app", gradleProjectPath = ":app"),
-            testSuites,
-            Nil,
-          ),
-        Duration.Inf,
-      )
-
-    assertEquals(command.take(2), List("gradle", "--console=plain"))
+      Await
+        .result(
+          gradleBuildTool(workspace)
+            .mbtTestCommand(
+              workspace,
+              mbtTarget("app", gradleProjectPath = ":app"),
+              testSuites,
+              Nil,
+            ),
+          Duration.Inf,
+        )
+        .arguments
     assert(command.contains("--init-script"))
     assertEquals(
       command.takeRight(3),
@@ -187,19 +187,22 @@ class GradleBuildToolSuite extends BaseSuite {
     )
 
     val command =
-      Await.result(
-        gradleBuildTool(workspace)
-          .mbtTestDebugCommand(
-            workspace,
-            mbtTarget("app"),
-            testSuites,
-            "debug-agent",
-            Nil,
-          ),
-        Duration.Inf,
-      )
+      Await
+        .result(
+          gradleBuildTool(workspace)
+            .mbtTestDebugCommand(
+              workspace,
+              mbtTarget("app"),
+              testSuites,
+              "debug-agent",
+              Nil,
+            ),
+          Duration.Inf,
+        )
+        .arguments
 
-    assertEquals(command.take(2), List("gradle", "--console=plain"))
+    assertEquals(command.head, "gradle")
+    assert(command.contains("--console=plain"))
     assert(command.contains("--init-script"))
     assertEquals(command.takeRight(3), List("test", "--tests", "a.FooTest"))
     val script =

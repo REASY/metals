@@ -10,13 +10,17 @@ import scala.util.Properties
 
 import scala.meta.internal.metals.BuildInfo
 import scala.meta.internal.metals.Embedded
-import scala.meta.internal.metals.UserConfiguration
+import scala.meta.internal.metals.MetalsEnrichments._
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.metals.mbt.MbtDebugLauncher
 import scala.meta.internal.metals.mbt.MbtTarget
+import scala.meta.internal.metals.mbt.MbtTestCommand
+import scala.meta.internal.metals.mbt.MbtTestReport
 import scala.meta.internal.metals.mbt.importer.GradleMbtImporter
 import scala.meta.internal.mtags.MD5
 import scala.meta.io.AbsolutePath
 
+import bloop.config.Config.TestFramework
 import ch.epfl.scala.bsp4j.ScalaMainClass
 import ch.epfl.scala.bsp4j.ScalaTestSuites
 import coursier.MavenRepository
@@ -265,9 +269,38 @@ case class GradleBuildTool(
       target: MbtTarget,
       testSuites: ScalaTestSuites,
       sourceFiles: Seq[AbsolutePath],
-  ): Future[List[String]] =
+      framework: Option[TestFramework] = None,
+  ): Future[MbtTestCommand] =
     Future.successful(
-      gradleTestCommand(target, testSuites, debugAgentFlag = None)
+      withTestReport(
+        gradleTestCommand(
+          target,
+          testSuites,
+          debugAgentFlag = None,
+          framework = framework,
+        )
+      )
+    )
+
+  private def withTestReport(arguments: List[String]): MbtTestCommand = {
+    val reportDirectory = AbsolutePath(
+      Files.createTempDirectory("gradle-test")
+    )
+    val reportArgument = s"-Dmetals.testReportDirectory=$reportDirectory"
+    MbtTestCommand(
+      arguments.take(1) ::: reportArgument :: arguments.drop(1),
+      () => gradleTestReport(reportDirectory),
+    )
+  }
+
+  private def gradleTestReport(directory: AbsolutePath): MbtTestReport =
+    MbtTestReport.readJunitReports(
+      MbtTestReport.xmlFiles(List(directory)),
+      s"Gradle test reports from $directory",
+      if (directory.exists) {
+        directory.deleteRecursively()
+        directory.deleteIfExists()
+      },
     )
 
   override def mbtTestDebugCommand(
@@ -276,9 +309,12 @@ case class GradleBuildTool(
       testSuites: ScalaTestSuites,
       debugAgentFlag: String,
       sourceFiles: Seq[AbsolutePath],
-  ): Future[List[String]] =
+      framework: Option[TestFramework] = None,
+  ): Future[MbtTestCommand] =
     Future.successful(
-      gradleTestCommand(target, testSuites, Some(debugAgentFlag))
+      withTestReport(
+        gradleTestCommand(target, testSuites, Some(debugAgentFlag), framework)
+      )
     )
 
   override def supportsForkedTestDebug: Boolean = true
@@ -288,11 +324,14 @@ case class GradleBuildTool(
       target: MbtTarget,
       testSuites: ScalaTestSuites,
       sourceFiles: Seq[AbsolutePath],
-  ): Int => Future[List[String]] = { port =>
+      framework: Option[TestFramework] = None,
+  ): Int => Future[MbtTestCommand] = { port =>
     val debugAgentFlag =
       s"-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=*:$port"
     Future.successful(
-      gradleTestCommand(target, testSuites, Some(debugAgentFlag))
+      withTestReport(
+        gradleTestCommand(target, testSuites, Some(debugAgentFlag), framework)
+      )
     )
   }
 
@@ -300,28 +339,32 @@ case class GradleBuildTool(
       target: MbtTarget,
       testSuites: ScalaTestSuites,
       debugAgentFlag: Option[String],
+      framework: Option[TestFramework],
   ): List[String] = {
     val jvmOptions =
       debugAgentFlag.toList ::: MbtDebugLauncher.listOrNil(
         testSuites.getJvmOptions
       )
     val initScriptArgs =
-      List("--init-script", gradleTestInitScript(target, jvmOptions).toString)
-
+      List(
+        "--init-script",
+        gradleTestInitScript(target, jvmOptions).toString,
+      )
     gradleBaseCommand() ::: List(
       "--console=plain"
     ) ::: initScriptArgs ::: List(
       gradleTask(target, "test")
-    ) ::: gradleTestFilterArgs(testSuites)
+    ) ::: gradleTestFilterArgs(testSuites, framework)
   }
 
   private def gradleTestFilterArgs(
-      testSuites: ScalaTestSuites
+      testSuites: ScalaTestSuites,
+      framework: Option[TestFramework],
   ): List[String] = {
     val filters =
       MbtDebugLauncher.listOrNil(testSuites.getSuites).flatMap { suite =>
         val className = suite.getClassName
-        val tests = MbtDebugLauncher.listOrNil(suite.getTests)
+        val tests = MbtDebugLauncher.testFilterNames(suite, framework)
         if (tests.isEmpty) List(className)
         else tests.map(test => s"$className.$test")
       }
@@ -338,6 +381,20 @@ case class GradleBuildTool(
         else s"    task.jvmArgs(${GradleBuildTool.groovyList(jvmOptions)})\n"
       s"""|  project.tasks.withType(Test).configureEach { task ->
           |$jvmArgsLine
+          |    def metalsTestReportDirectory = System.getProperty('metals.testReportDirectory')
+          |    if (metalsTestReportDirectory != null) {
+          |      def junitXml = task.reports.junitXml
+          |      if (junitXml.hasProperty('required')) {
+          |        junitXml.required.set(true)
+          |      } else {
+          |        junitXml.enabled = true
+          |      }
+          |      if (junitXml.hasProperty('outputLocation')) {
+          |        junitXml.outputLocation.set(task.project.file(metalsTestReportDirectory))
+          |      } else {
+          |        junitXml.destination = task.project.file(metalsTestReportDirectory)
+          |      }
+          |    }
           |    task.testLogging {
           |      events 'failed', 'skipped'
           |      exceptionFormat = 'full'

@@ -40,7 +40,9 @@ case class SemanticdbSymbolInformation(
 object SemanticdbTextDocumentsResult {
   val SchemaVersion = "metals-semanticdb-text-documents.v1"
 
-  def fromSemanticdb(documents: s.TextDocuments): SemanticdbTextDocumentsResult =
+  def fromSemanticdb(
+      documents: s.TextDocuments
+  ): SemanticdbTextDocumentsResult =
     SemanticdbTextDocumentsResult(
       SchemaVersion,
       documents.documents.sortBy(_.uri).map(toDocument).asJava,

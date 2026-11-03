@@ -1,12 +1,12 @@
 package tests.gradle
 
-import scala.meta.internal.metals.AutoImportBuildKind
-import scala.meta.internal.metals.Configs.JavaSymbolLoaderConfig
-import scala.meta.internal.metals.Configs.ReferenceProviderConfig
-import scala.meta.internal.metals.Configs.WorkspaceSymbolProviderConfig
 import scala.meta.internal.metals.Messages
 import scala.meta.internal.metals.MetalsEnrichments._
-import scala.meta.internal.metals.UserConfiguration
+import scala.meta.internal.metals.config.AutoImportBuildKind
+import scala.meta.internal.metals.config.JavaSymbolLoaderConfig
+import scala.meta.internal.metals.config.ReferenceProviderConfig
+import scala.meta.internal.metals.config.UserConfiguration
+import scala.meta.internal.metals.config.WorkspaceSymbolProviderConfig
 import scala.meta.internal.metals.mbt.MbtBuildServer
 import scala.meta.internal.metals.{BuildInfo => V}
 
@@ -25,11 +25,11 @@ class GradleMbtLspSuite
       presentationCompilerDiagnostics = true,
       buildOnChange = false,
       buildOnFocus = false,
-      workspaceSymbolProvider = WorkspaceSymbolProviderConfig.mbt,
-      javaSymbolLoader = JavaSymbolLoaderConfig.turbineClasspath,
-      referenceProvider = ReferenceProviderConfig.mbt,
+      workspaceSymbolProvider = WorkspaceSymbolProviderConfig.MBT,
+      javaSymbolLoader = JavaSymbolLoaderConfig.TurbineClasspath,
+      referenceProvider = ReferenceProviderConfig.MBT,
       preferredBuildServer = Some(MbtBuildServer.name),
-      automaticImportBuild = AutoImportBuildKind.All,
+      autoImportBuilds = AutoImportBuildKind.All,
     )
 
   test("basic") {
@@ -114,13 +114,22 @@ class GradleMbtLspSuite
             |        "src/main/java",
             |        "src/main/scala"
             |      ],
-            |      "scalacOptions": [],
-            |      "javacOptions": [],
+            |      "scalacOptions": [
+            |        "-deprecation",
+            |        "-unchecked"
+            |      ],
+            |      "javacOptions": [
+            |        "-source",
+            |        "17",
+            |        "-target",
+            |        "17"
+            |      ],
             |      "dependencyModules": [
             |        "org.scala-lang:scala-library:2.13.18",
             |        "org.typelevel:cats-core_2.13:2.13.0",
             |        "org.typelevel:cats-kernel_2.13:2.13.0"
             |      ],
+            |      "scalaVersion": "2.13.18",
             |      "javaHome": "<javaHome-path>",
             |      "classDirectories": [
             |        "build/classes/java/main",
@@ -133,13 +142,22 @@ class GradleMbtLspSuite
             |        "src/test/java",
             |        "src/test/scala"
             |      ],
-            |      "scalacOptions": [],
-            |      "javacOptions": [],
+            |      "scalacOptions": [
+            |        "-deprecation",
+            |        "-unchecked"
+            |      ],
+            |      "javacOptions": [
+            |        "-source",
+            |        "17",
+            |        "-target",
+            |        "17"
+            |      ],
             |      "dependencyModules": [
             |        "org.scala-lang:scala-library:2.13.18",
             |        "org.typelevel:cats-core_2.13:2.13.0",
             |        "org.typelevel:cats-kernel_2.13:2.13.0"
             |      ],
+            |      "scalaVersion": "2.13.18",
             |      "javaHome": "<javaHome-path>",
             |      "dependsOn": [
             |        "basic"
@@ -205,6 +223,125 @@ class GradleMbtLspSuite
     } yield ()
   }
 
+  test("compiler-options") {
+    client.selectedServer = Messages.ChooseBuildServer.mbt
+    cleanWorkspace()
+    for {
+      _ <- initialize(
+        s"""|/build.gradle
+            |plugins {
+            |    id 'scala'
+            |}
+            |repositories {
+            |    mavenCentral()
+            |}
+            |dependencies {
+            |    implementation 'org.scala-lang:scala-library:${V.scala213}'
+            |}
+            |tasks.named('compileScala', ScalaCompile) {
+            |    scalaCompileOptions.additionalParameters = ['-feature']
+            |}
+            |tasks.named('compileTestScala', ScalaCompile) {
+            |    scalaCompileOptions.deprecation = false
+            |    scalaCompileOptions.unchecked = false
+            |    scalaCompileOptions.additionalParameters = ['-Xsource:3']
+            |}
+            |tasks.named('compileJava', JavaCompile) {
+            |    options.release = 11
+            |    options.compilerArgs += ['-Xlint:deprecation']
+            |}
+            |tasks.named('compileTestJava', JavaCompile) {
+            |    options.release = 17
+            |    options.compilerArgs += ['-parameters']
+            |}
+            |/src/main/scala/example/Main.scala
+            |package example
+            |
+            |object Main {
+            |  def msg = "hello"
+            |}
+            |/src/test/scala/example/MainTest.scala
+            |package example
+            |
+            |class MainTest {
+            |  def testMsg = Main.msg
+            |}
+            |""".stripMargin
+      )
+      _ <- server.headServer.connectionProvider.buildServerPromise.future
+      mbtFile = workspace.resolve(".metals/mbt.json").readText
+      _ = assertNoDiff(
+        escapeMbtFile(mbtFile),
+        s"""|{
+            |  "dependencyModules": [
+            |    {
+            |      "id": "org.scala-lang:scala-library:${V.scala213}",
+            |      "jar": "<jar-path>",
+            |      "sources": "<sources-path>"
+            |    }
+            |  ],
+            |  "namespaces": {
+            |    "compiler-options": {
+            |      "sources": [
+            |        "src/main/java",
+            |        "src/main/scala"
+            |      ],
+            |      "scalacOptions": [
+            |        "-deprecation",
+            |        "-unchecked",
+            |        "-feature"
+            |      ],
+            |      "javacOptions": [
+            |        "--release",
+            |        "11",
+            |        "-Xlint:deprecation"
+            |      ],
+            |      "dependencyModules": [
+            |        "org.scala-lang:scala-library:${V.scala213}"
+            |      ],
+            |      "scalaVersion": "${V.scala213}",
+            |      "javaHome": "<javaHome-path>",
+            |      "classDirectories": [
+            |        "build/classes/java/main",
+            |        "build/classes/scala/main"
+            |      ],
+            |      "projectPath": ":"
+            |    },
+            |    "compiler-options:test": {
+            |      "sources": [
+            |        "src/test/java",
+            |        "src/test/scala"
+            |      ],
+            |      "scalacOptions": [
+            |        "-Xsource:3"
+            |      ],
+            |      "javacOptions": [
+            |        "--release",
+            |        "17",
+            |        "-parameters"
+            |      ],
+            |      "dependencyModules": [
+            |        "org.scala-lang:scala-library:${V.scala213}"
+            |      ],
+            |      "scalaVersion": "${V.scala213}",
+            |      "javaHome": "<javaHome-path>",
+            |      "dependsOn": [
+            |        "compiler-options"
+            |      ],
+            |      "classDirectories": [
+            |        "build/classes/java/test",
+            |        "build/classes/scala/test"
+            |      ],
+            |      "projectPath": ":"
+            |    }
+            |  },
+            |  "uncheckedSources": []
+            |}
+            |""".stripMargin,
+      )
+    } yield ()
+  }
+
   test("plain-java") {
     cleanWorkspace()
     for {
@@ -251,7 +388,12 @@ class GradleMbtLspSuite
             |        "src/main/java"
             |      ],
             |      "scalacOptions": [],
-            |      "javacOptions": [],
+            |      "javacOptions": [
+            |        "-source",
+            |        "17",
+            |        "-target",
+            |        "17"
+            |      ],
             |      "dependencyModules": [
             |        "org.jsoup:jsoup:1.21.1"
             |      ],
@@ -264,7 +406,12 @@ class GradleMbtLspSuite
             |        "src/test/java"
             |      ],
             |      "scalacOptions": [],
-            |      "javacOptions": [],
+            |      "javacOptions": [
+            |        "-source",
+            |        "17",
+            |        "-target",
+            |        "17"
+            |      ],
             |      "dependencyModules": [
             |        "org.jsoup:jsoup:1.21.1"
             |      ],
@@ -403,7 +550,12 @@ class GradleMbtLspSuite
             |        "src/main/java"
             |      ],
             |      "scalacOptions": [],
-            |      "javacOptions": [],
+            |      "javacOptions": [
+            |        "-source",
+            |        "17",
+            |        "-target",
+            |        "17"
+            |      ],
             |      "dependencyModules": [
             |        "org.jsoup:jsoup:1.21.1"
             |      ],
@@ -419,7 +571,12 @@ class GradleMbtLspSuite
             |        "src/test/java"
             |      ],
             |      "scalacOptions": [],
-            |      "javacOptions": [],
+            |      "javacOptions": [
+            |        "-source",
+            |        "17",
+            |        "-target",
+            |        "17"
+            |      ],
             |      "dependencyModules": [
             |        "org.jsoup:jsoup:1.21.1"
             |      ],
@@ -436,7 +593,12 @@ class GradleMbtLspSuite
             |        "plugin-lib/src/main/java"
             |      ],
             |      "scalacOptions": [],
-            |      "javacOptions": [],
+            |      "javacOptions": [
+            |        "-source",
+            |        "17",
+            |        "-target",
+            |        "17"
+            |      ],
             |      "dependencyModules": [
             |        "org.jsoup:jsoup:1.21.1"
             |      ],
@@ -449,7 +611,12 @@ class GradleMbtLspSuite
             |        "plugin-lib/src/test/java"
             |      ],
             |      "scalacOptions": [],
-            |      "javacOptions": [],
+            |      "javacOptions": [
+            |        "-source",
+            |        "17",
+            |        "-target",
+            |        "17"
+            |      ],
             |      "dependencyModules": [
             |        "junit:junit:4.13.2",
             |        "org.hamcrest:hamcrest-core:1.3",

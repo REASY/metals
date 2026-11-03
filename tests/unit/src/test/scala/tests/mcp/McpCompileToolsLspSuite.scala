@@ -2,7 +2,7 @@ package tests.mcp
 
 import java.nio.file.Paths
 
-import scala.meta.internal.metals.UserConfiguration
+import scala.meta.internal.metals.config.UserConfiguration
 
 import tests.BaseLspSuite
 
@@ -59,6 +59,28 @@ class McpCompileToolsLspSuite
       result3 <- client.compileFile("non-existent.scala")
       _ = assert(result3.contains("Error: File not found"), result3)
 
+      _ <- client.shutdown()
+    } yield ()
+  }
+
+  test("compile-file-outside-build") {
+    cleanWorkspace()
+    for {
+      _ <- initialize(
+        s"""
+           |/metals.json
+           |{"a": {}}
+           |/a/src/main/scala/com/example/Hello.scala
+           |package com.example
+           |object Hello
+           |/Outside.scala
+           |object Outside
+           |""".stripMargin
+      )
+      client <- startMcpServer()
+      result <- client.compileFile("Outside.scala")
+      _ = assert(result.contains("no build target for"), result)
+      _ = assert(result.contains("`import-build`"), result)
       _ <- client.shutdown()
     } yield ()
   }

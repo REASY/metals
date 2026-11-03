@@ -7,8 +7,8 @@ import java.nio.file.Paths
 import scala.util.Try
 
 import scala.meta.internal.io.FileIO
-import scala.meta.internal.metals.Configs.FallbackClasspathConfig
 import scala.meta.internal.metals.MetalsEnrichments._
+import scala.meta.internal.metals.config.FallbackClasspathConfig
 import scala.meta.internal.metals.mbt.MbtBuild
 import scala.meta.io.AbsolutePath
 
@@ -42,7 +42,7 @@ class FallbackClasspaths(
     workspace: AbsolutePath,
     buildTargets: BuildTargets = BuildTargets.empty,
     fallbackClasspathsConfig: () => FallbackClasspathConfig = () =>
-      FallbackClasspathConfig.default,
+      FallbackClasspathConfig.All3rdparty,
     scalaVersionSelector: ScalaVersionSelector = ScalaVersionSelector.default,
     mbtBuild: () => MbtBuild,
 ) extends BaseFallbackClasspaths {
@@ -109,8 +109,10 @@ class FallbackClasspaths(
       scalaVersionSelector.fallbackScalaVersion()
     ScalaVersions.scalaBinaryVersionFromFullVersion(scalaVersion)
   }
-  def scalaCompilerClasspath(): Seq[Path] = {
-    val scalaBinaryVerion = fallbackScalaBinaryVersion()
+  def scalaCompilerClasspath(): Seq[Path] =
+    scalaCompilerClasspath(fallbackScalaBinaryVersion())
+
+  def scalaCompilerClasspath(scalaBinaryVerion: String): Seq[Path] = {
     fallbackCompilerClasspath(
       id =>
         // IMPORTANT: we must only include dependencies from targets that have a

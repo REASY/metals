@@ -34,9 +34,9 @@ import scala.meta.internal.metals.MutableCancelable
 import scala.meta.internal.metals.ScalaVersionSelector
 import scala.meta.internal.metals.Time
 import scala.meta.internal.metals.Timer
-import scala.meta.internal.metals.UserConfiguration
 import scala.meta.internal.metals.WorkDoneProgress
 import scala.meta.internal.metals.clients.language.MetalsLanguageClient
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.mtags.MD5
 import scala.meta.internal.pc.CompilerJobQueue
 import scala.meta.internal.pc.InterruptException
@@ -569,34 +569,34 @@ object WorksheetProvider {
   }
   final case class MdocRef(scalaVersion: String, value: Mdoc)
 
-  def worksheetScala3AdjustmentsForPC(
+  private def worksheetScala3AdjustmentsForPC(
       originInput: Input.VirtualFile
-  ): Option[(Input.VirtualFile, AdjustLspData)] = {
+  ): (Input.VirtualFile, AdjustLspData) = {
     val ident = "  "
     val withOuter =
       s"""object worksheet{\n$ident${originInput.value.replace("\n", "\n" + ident)}\n}"""
     val modifiedInput =
       originInput.copy(value = withOuter)
     val adjustLspData = AdjustedLspData.create(
-      pos => {
-        new Position(pos.getLine() - 1, pos.getCharacter() - ident.size)
+      {
+        case (line, column) => {
+          (line - 1, column - ident.size)
+        }
       },
       filterOutLocations = { loc => !loc.getUri().isWorksheet },
     )
-    Some((modifiedInput, adjustLspData))
+    (modifiedInput, adjustLspData)
   }
 
   def worksheetScala3Adjustments(
       originInput: Input.VirtualFile
-  ): Option[(Input.VirtualFile, Position => Position, AdjustLspData)] = {
-    worksheetScala3AdjustmentsForPC(originInput).map { case (input, adjust) =>
-      def adjustRequest(position: Position) = new Position(
-        position.getLine() + 1,
-        position.getCharacter() + 2,
-      )
-      (input, adjustRequest, adjust)
-
-    }
+  ): (Input.VirtualFile, Position => Position, AdjustLspData) = {
+    val (input, adjust) = worksheetScala3AdjustmentsForPC(originInput)
+    def adjustRequest(position: Position) = new Position(
+      position.getLine() + 1,
+      position.getCharacter() + 2,
+    )
+    (input, adjustRequest, adjust)
   }
 }
 

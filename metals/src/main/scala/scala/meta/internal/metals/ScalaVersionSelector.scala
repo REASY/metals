@@ -1,7 +1,9 @@
 package scala.meta.internal.metals
 
 import scala.meta._
+import scala.meta.internal.builds.SbtBuildTool
 import scala.meta.internal.metals.MetalsEnrichments._
+import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.io.AbsolutePath
 object ScalaVersionSelector {
   def default: ScalaVersionSelector = new ScalaVersionSelector(
@@ -32,11 +34,32 @@ class ScalaVersionSelector(
           .getOrElse(BuildInfo.scala213)
     }
 
-    if (ScalaVersions.isSupportedAtReleaseMomentScalaVersion(selected))
-      selected
-    else
-      ScalaVersions.recommendedVersion(selected)
+    supportedVersion(selected)
   }
+
+  /**
+   * Picks the latest scala version used in the workspace that shares
+   * the same minor as `scalaBinaryVersion`.
+   */
+  def fallbackScalaVersion(scalaBinaryVersion: String): String = {
+    val selected = buildTargets.allScala.toList
+      .map(_.scalaInfo.getScalaVersion)
+      .filter(version =>
+        ScalaVersions.scalaBinaryVersionFromFullVersion(
+          version
+        ) == scalaBinaryVersion
+      )
+      .sorted
+      .lastOption
+      .getOrElse(fallbackScalaVersion())
+    supportedVersion(selected)
+  }
+
+  private def supportedVersion(scalaVersion: String): String =
+    if (ScalaVersions.isSupportedAtReleaseMomentScalaVersion(scalaVersion))
+      scalaVersion
+    else
+      ScalaVersions.recommendedVersion(scalaVersion)
 
   def fallbackDialect(): Dialect = {
     ScalaVersions.dialectForScalaVersion(
@@ -61,7 +84,12 @@ class ScalaVersionSelector(
         dialectFromBuildTarget(path).getOrElse(
           fallbackDialect()
         )
-      case Some("sbt") => dialects.Sbt
+      case Some("sbt") =>
+        dialectFromBuildTarget(path).getOrElse(
+          ScalaVersions.dialectForSbtVersion(
+            SbtBuildTool.loadVersionForPath(path)
+          )
+        )
       case Some("sc") =>
         val dialect = dialectFromBuildTarget(path).getOrElse(
           fallbackDialect()
