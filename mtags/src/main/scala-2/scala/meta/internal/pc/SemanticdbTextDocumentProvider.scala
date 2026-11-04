@@ -126,6 +126,7 @@ class SemanticdbTextDocumentProvider(
     } finally {
       if (shouldPrune) {
         PruneLateSourcesComponent.loadedFromSource.remove(unit.source.file)
+        semanticdbOps.gSourceFileInputCache.remove(unit.source)
         removeAfterUsing(uri.toString())
       }
     }

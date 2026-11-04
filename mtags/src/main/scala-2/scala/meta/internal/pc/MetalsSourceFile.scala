@@ -36,13 +36,14 @@ object MetalsSourceFile {
   // splits both compiler units and nominal symbols when that source is opened.
   // Only the identity comes from disk: BatchSourceFile still uses the caller's
   // contents, including unsaved edits and files which have not been saved yet.
-  private[pc] def file(filename: String): AbstractFile =
-    Try(new URI(filename)).toOption
-      .filter(_.getScheme == "file")
-      .flatMap(uri =>
-        Try(
-          new PlainFile(scala.reflect.io.Path(Paths.get(uri).toFile))
-        ).toOption
-      )
-      .getOrElse(new VirtualFile(filename))
+  private[pc] def file(filename: String): AbstractFile = {
+    val physicalFile = for {
+      uri <- Try(new URI(filename)).toOption
+      if uri.getScheme == "file"
+      file <- Try(
+        new PlainFile(scala.reflect.io.Path(Paths.get(uri).toFile))
+      ).toOption
+    } yield file
+    physicalFile.getOrElse(new VirtualFile(filename))
+  }
 }

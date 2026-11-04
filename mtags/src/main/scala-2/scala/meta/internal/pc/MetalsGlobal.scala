@@ -99,6 +99,13 @@ class MetalsGlobal(
 
   val compileUnitsCache = new CompileUnitsCache(5)
   private val evictedCompilationUnits = mutable.Set.empty[String]
+
+  // Keep the unmarked document text with the cached unit: moving a completion
+  // cursor changes the synthetic source but must not invalidate typer state.
+  private class BufferCompilationUnit(
+      source: SourceFile,
+      val documentText: String
+  ) extends RichCompilationUnit(source)
   def didChange(uri: URI): Unit = {
     compileUnitsCache.didChange(uri)
   }
@@ -815,10 +822,16 @@ class MetalsGlobal(
 
     // Replaced source symbols invalidate dependent nested-type signatures.
     // An eviction affects this request only if it re-enters the evicted file.
-    val changedSource = unitOfFile.get(unit.source.file).exists { previous =>
-      !util.Arrays.equals(previous.source.content, unit.source.content)
+    val changedSource = unitOfFile.get(unit.source.file).exists {
+      case previous: BufferCompilationUnit => previous.documentText != code
+      case previous =>
+        val unmarkedSource =
+          if (cursor.isDefined) new MetalsSourceFile(filename, code.toCharArray)
+          else unit.source
+        !util.Arrays.equals(previous.source.content, unmarkedSource.content)
     }
     val reenteredEvictedUnit = evictedCompilationUnits.remove(filename)
+    val previousRun = currentRun
     if (reenteredEvictedUnit || changedSource) {
       newTyperRun()
     }
@@ -827,7 +840,7 @@ class MetalsGlobal(
       if (filename.isScalaScript || filename.isSbt || filename.isMill)
         ScriptSourceFile(unit.source.file, unit.source.content)
       else unit.source
-    val richUnit = new RichCompilationUnit(source)
+    val richUnit = new BufferCompilationUnit(source, code)
     // An explicitly queried document must be fully typed even when an earlier
     // request loaded and pruned it through the source path. A pruned SemanticDB
     // request re-registers the unit after addCompilationUnit returns.
@@ -854,7 +867,7 @@ class MetalsGlobal(
         unitOfFile(richUnit.source.file) = richUnit
 
         maybeOldUnit.foreach { _ =>
-          currentRun.symSource.foreach { case (sym, _) =>
+          previousRun.symSource.foreach { case (sym, _) =>
             // otherwise we seem to be getting stale symbol completions for toplevels
             if (sym.owner.hasPackageFlag && sym.isStale) {
               sym.owner.info.decls unlink sym
