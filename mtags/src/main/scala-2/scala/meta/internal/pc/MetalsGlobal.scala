@@ -866,12 +866,26 @@ class MetalsGlobal(
       case maybeOldUnit =>
         unitOfFile(richUnit.source.file) = richUnit
 
-        maybeOldUnit.foreach { _ =>
-          previousRun.symSource.foreach { case (sym, _) =>
-            // otherwise we seem to be getting stale symbol completions for toplevels
-            if (sym.owner.hasPackageFlag && sym.isStale) {
+        maybeOldUnit.foreach { oldUnit =>
+          def unlinkStale(sym: Symbol): Unit = {
+            if (
+              sym != null && sym != NoSymbol && sym.owner.hasPackageFlag && sym.isStale
+            ) {
               sym.owner.info.decls unlink sym
             }
+          }
+          previousRun.symSource.keys.foreach(unlinkStale)
+          // Intervening edits can rotate symSource without recompiling this
+          // file. Its cached trees still identify the declarations to unlink,
+          // without retaining another registry of symbols across typer runs.
+          def unlinkDeclarations(tree: Tree): Unit = tree match {
+            case PackageDef(_, stats) => stats.foreach(unlinkDeclarations)
+            case definition: ImplDef => unlinkStale(definition.symbol)
+            case _ =>
+          }
+          unlinkDeclarations(oldUnit.body)
+          if (oldUnit.lastBody ne oldUnit.body) {
+            unlinkDeclarations(oldUnit.lastBody)
           }
         }
         // A source-path unit can have symbols without an interactive unit.

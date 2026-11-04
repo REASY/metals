@@ -96,6 +96,46 @@ class SourceRequestLifecycleSuite extends munit.FunSuite {
     }
   }
 
+  test("rename-cleans-top-levels-after-an-intervening-file-edit") {
+    val text =
+      "package example; class OldName {}; object OldName {}; class Kept {}"
+    withSource(text) { (compiler, path) =>
+      import compiler.{assert => _, _}
+      val provider = new SemanticdbTextDocumentProvider(compiler, Nil)
+      def query(file: Path, code: String): Unit = {
+        val document = provider.textDocument(file.toUri, code)
+        assertEquals(
+          document.diagnostics.filter(_.severity == Diagnostic.Severity.ERROR),
+          Nil
+        )
+        assert(document.symbols.nonEmpty)
+      }
+      query(path, text)
+      val oldClass = rootMirror.staticClass("example.OldName")
+      val oldModule = rootMirror.staticModule("example.OldName")
+      val owner = oldClass.owner
+      val kept = rootMirror.staticClass("example.Kept")
+      val other = path.resolveSibling("Unrelated.scala")
+      val otherText = "package example; class Unrelated { val value = 1 }"
+      query(other, otherText)
+      val epoch = currentRunId
+      query(other, otherText.replace("= 1", "= 2"))
+      assert(currentRunId > epoch)
+      assert(!currentRun.symSource.values.exists(_ == oldClass.pos.source.file))
+      val renamed = text.replace("OldName", "NewName")
+      addCompilationUnit(renamed, path.toUri.toString, None)
+      assertEquals(owner.info.decls.lookup(oldClass.name), NoSymbol)
+      assertEquals(owner.info.decls.lookup(oldModule.name), NoSymbol)
+      assertEquals(owner.info.decls.lookup(kept.name), kept)
+      query(path, renamed)
+      assert(rootMirror.staticClass("example.NewName") != NoSymbol)
+      assert(rootMirror.staticModule("example.NewName") != NoSymbol)
+      assert(rootMirror.staticClass("example.Unrelated") != NoSymbol)
+      assertEquals(new String(Files.readAllBytes(path), UTF_8), text)
+      assert(!Files.exists(other))
+    }
+  }
+
   test("pruned-input-cache-is-released-with-unsaved-error-evidence-retained") {
     val text = "object Model { def value: Int = 1 }"
     withSource(text) { (compiler, path) =>
