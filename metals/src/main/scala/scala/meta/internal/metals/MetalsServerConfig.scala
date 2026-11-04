@@ -45,8 +45,8 @@ import scala.meta.pc.PresentationCompilerConfig.OverrideDefFormat
  *                                       supports a small subset of this, so it may be problematic
  *                                       for certain clients.
  * @param macOsMaxWatchRoots The maximum number of root directories to watch on MacOS.
- * @param maxLogFileSize The maximum size of the log file before it gets backed up and truncated.
- * @param maxLogBackups The maximum number of backup log files.
+ * @param maxLogFileSize Positive byte limit for each active/runtime-rotated log chunk, also used for startup backups.
+ * @param maxLogBackups Non-negative limit for runtime chunks and, separately, historical startup backups.
  * @param metalsToIdleTime The time that needs to pass with no action to consider metals as idle.
  * @param pingInterval Interval in which we ping the build server.
  * @param workspaceSymbolProvider What indexer to use for workspace/symbol.

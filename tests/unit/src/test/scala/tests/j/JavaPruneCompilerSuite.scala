@@ -4,6 +4,32 @@ import tests.JavaModuleExports
 
 class JavaPruneCompilerSuite extends BaseJavaPruneCompilerSuite {
 
+  test("dependency-constructor-does-not-poison-caller-task") {
+    val result = compileFiles(
+      """|/example/Base.java
+         |package example;
+         |public class Base {
+         |  public Base(String value) {}
+         |}
+         |/example/Derived.java
+         |package example;
+         |public class Derived extends Base {
+         |  public Derived(String value) { super(value); }
+         |  public Derived() { this("default"); }
+         |  public String value() { return "value"; }
+         |}
+         |/example/Caller.java
+         |package example;
+         |public class Caller {
+         |  public int length() { return new Derived().value().length(); }
+         |}
+         |""".stripMargin,
+      "example/Caller.java",
+    )
+    assertEquals(result.diagnostics, Nil)
+    assertEquals(result.taskErrorCodes, Nil)
+  }
+
   checkNoErrors(
     "class",
     """|/a/src/main/java/example/foo/Example.java

@@ -5,6 +5,8 @@ import java.util.concurrent.CompletableFuture
 
 import scala.meta.internal.metals.DidFocusResult
 import scala.meta.internal.metals.HoverExtParams
+import scala.meta.internal.metals.SemanticdbTextDocumentsParams
+import scala.meta.internal.metals.SemanticdbTextDocumentsResult
 import scala.meta.internal.metals.clients.language.MetalsTerminalInputParams
 import scala.meta.internal.metals.doctor.DoctorVisibilityDidChangeParams
 import scala.meta.internal.metals.findfiles.FindTextInDependencyJarsRequest
@@ -33,6 +35,37 @@ import org.eclipse.lsp4j.jsonrpc.messages.{Either => JEither}
 class DelegatingScalaService(
     @volatile var underlying: ScalaLspService
 ) extends ScalaLspService {
+  override def scalaConstructorEvidence(
+      params: SemanticdbTextDocumentsParams
+  ): CompletableFuture[
+    scala.meta.internal.metals.ScalaConstructorEvidenceResult
+  ] =
+    underlying.scalaConstructorEvidence(params)
+
+  override def javaCompiledOrigins(
+      params: scala.meta.internal.metals.JavaReceiverTypesParams
+  ): CompletableFuture[com.google.gson.JsonObject] =
+    underlying.javaCompiledOrigins(params)
+
+  override def scalaCallableEvidence(
+      params: SemanticdbTextDocumentsParams
+  ): CompletableFuture[scala.meta.internal.metals.ScalaCallableEvidenceResult] =
+    underlying.scalaCallableEvidence(params)
+
+  override def javaDependencyBodies(
+      params: scala.meta.internal.metals.JavaDependencyBodiesParams
+  ): CompletableFuture[com.google.gson.JsonObject] =
+    underlying.javaDependencyBodies(params)
+
+  override def javaReceiverTypes(
+      params: scala.meta.internal.metals.JavaReceiverTypesParams
+  ): CompletableFuture[com.google.gson.JsonObject] =
+    underlying.javaReceiverTypes(params)
+
+  override def semanticdbTextDocuments(
+      params: SemanticdbTextDocumentsParams
+  ): CompletableFuture[SemanticdbTextDocumentsResult] =
+    underlying.semanticdbTextDocuments(params)
 
   override def didOpen(
       params: DidOpenTextDocumentParams

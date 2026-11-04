@@ -7,6 +7,7 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.function.Supplier
 import java.{util => ju}
 
+import scala.annotation.nowarn
 import scala.concurrent.Await
 import scala.concurrent.ExecutionContextExecutorService
 import scala.concurrent.Future
@@ -158,6 +159,11 @@ class CompilerConfiguration(
       lastAccessedMs = time.currentMillis()
       awaitCompiler
     }
+
+    def awaitBuildTargetCompiler(
+        @nowarn("cat=unused-params") timeout: Duration
+    ): PresentationCompiler =
+      await
   }
 
   case class StandaloneJavaCompiler(
@@ -331,6 +337,13 @@ class CompilerConfiguration(
             }
           }
       }
+    }
+
+    override def awaitBuildTargetCompiler(
+        timeout: Duration
+    ): PresentationCompiler = {
+      lastAccessedMs = time.currentMillis()
+      Await.result(presentationCompilerFuture, timeout)
     }
 
     def shutdown(): Unit = {

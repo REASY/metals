@@ -4,13 +4,50 @@ import java.net.URI
 import java.nio.charset.StandardCharsets
 
 import scala.meta.internal.io.FileIO
+import scala.meta.internal.jdk.CollectionConverters._
 import scala.meta.internal.metals.CompilerVirtualFileParams
 import scala.meta.internal.metals.JdkSources
 import scala.meta.internal.{semanticdb => s}
 
+import coursierapi.Dependency
 import tests.pc.BaseJavaSemanticdbSuite
 
 class SemanticdbSuite extends BaseJavaSemanticdbSuite {
+
+  test("overloaded-static-import-callsite") {
+    val code =
+      """|package overload;
+         |import static org.assertj.core.api.Assertions.assertThat;
+         |
+         |class Caller {
+         |  void check(String expected, String actual) {
+         |    assertThat(actual).isEqualTo(expected);
+         |  }
+         |}
+         |""".stripMargin
+    val document = textDocument(code, URI.create("file:///Caller.java"))
+    val callSymbols = document.getOccurrencesList.asScala
+      .filter(occurrence =>
+        occurrence.hasRange && occurrence.getRange.getStartLine == 5
+      )
+      .map(_.getSymbol)
+
+    assert(
+      callSymbols.exists(
+        _.startsWith("org/assertj/core/api/Assertions#assertThat(")
+      ),
+      clues(callSymbols),
+    )
+    assert(
+      callSymbols.exists(
+        _.startsWith("org/assertj/core/api/AbstractStringAssert#isEqualTo(")
+      ),
+      clues(callSymbols),
+    )
+  }
+
+  override protected def extraDependencies: Seq[Dependency] =
+    Seq(Dependency.of("org.assertj", "assertj-core", "3.26.3"))
 
   check(
     "basic",

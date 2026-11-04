@@ -1,5 +1,7 @@
 package tests.mbt
 
+import java.nio.file.Path
+
 import scala.collection.parallel.mutable.ParArray
 import scala.jdk.CollectionConverters._
 
@@ -145,9 +147,28 @@ class ProtoOutlineTypesSuite extends BaseSuite {
         "what the indexing reports",
       )
       assertEquals(
-        compile(outlines),
+        compile(outlines, Seq(protobufClasspath)).lowered
+          .bytes()
+          .keySet()
+          .asScala
+          .toSet,
         expected,
         "what Turbine emitted",
+      )
+      // Codehop's compiler-evidence export deliberately withholds partial
+      // headers when the dependency classpath is unavailable. Their source
+      // identities must still survive for indexing and invalidation.
+      val unavailable = compile(outlines, Nil)
+      assertEquals(
+        unavailable.lowered.bytes().keySet().asScala.toSet,
+        Set.empty[String],
+      )
+      assertEquals(
+        ProtoOutlineTypes
+          .declaredBy(unavailable.sourceFallbacks, new Mtags())
+          .toSet,
+        expected,
+        "unavailable dependency signatures retain source identities, not classfiles",
       )
     }
 
@@ -179,7 +200,16 @@ class ProtoOutlineTypesSuite extends BaseSuite {
     }
   }
 
-  private def compile(outlines: Seq[VirtualTextDocument]): Set[String] =
+  private val protobufClasspath = Path.of(
+    classOf[
+      com.google.protobuf.Message
+    ].getProtectionDomain.getCodeSource.getLocation.toURI
+  )
+
+  private def compile(
+      outlines: Seq[VirtualTextDocument],
+      classpath: Seq[Path],
+  ) =
     TurbineCompiler
       .compileClassfiles[Seq[SourceFile]](
         toParse = ParArray(
@@ -188,14 +218,9 @@ class ProtoOutlineTypesSuite extends BaseSuite {
           )
         ),
         toSourceFile = identity,
-        classpath = Nil,
+        classpath = classpath,
         progressBars = ProgressBars.EMPTY,
       )
-      .lowered
-      .bytes()
-      .keySet()
-      .asScala
-      .toSet
 
   private val protoFileName = "user_profile.proto"
 }

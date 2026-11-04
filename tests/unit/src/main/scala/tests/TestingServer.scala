@@ -55,6 +55,8 @@ import scala.meta.internal.metals.ParametrizedCommand
 import scala.meta.internal.metals.PositionSyntax._
 import scala.meta.internal.metals.ProgressTicks
 import scala.meta.internal.metals.ReportContext
+import scala.meta.internal.metals.SemanticdbTextDocumentsParams
+import scala.meta.internal.metals.SemanticdbTextDocumentsResult
 import scala.meta.internal.metals.ServerCommands
 import scala.meta.internal.metals.StdReportContext
 import scala.meta.internal.metals.TextEdits
@@ -2435,6 +2437,17 @@ final case class TestingServer(
       .asScala
       .map(_.asScala.toList)
   }
+
+  def semanticdbTextDocuments(
+      filenames: List[String]
+  ): Future[SemanticdbTextDocumentsResult] =
+    fullServer
+      .semanticdbTextDocuments(
+        SemanticdbTextDocumentsParams(
+          filenames.map(filename => toPath(filename).toURI.toString).asJava
+        )
+      )
+      .asScala
 
   def textContents(filename: String): String =
     toPath(filename).toInputFromBuffers(buffers).text

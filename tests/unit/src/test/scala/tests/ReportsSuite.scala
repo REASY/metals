@@ -3,8 +3,12 @@ package tests
 import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.Optional
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 import scala.meta.internal.metals.Buffers
 import scala.meta.internal.metals.BuildTargets
@@ -13,6 +17,7 @@ import scala.meta.internal.metals.DefinitionResult
 import scala.meta.internal.metals.FolderReportsZippper
 import scala.meta.internal.metals.Icons
 import scala.meta.internal.metals.MetalsEnrichments._
+import scala.meta.internal.metals.RecursivelyDelete
 import scala.meta.internal.metals.Report
 import scala.meta.internal.metals.ReportFileName
 import scala.meta.internal.metals.ScalaVersionSelector
@@ -22,6 +27,7 @@ import scala.meta.internal.metals.ZipReportsProvider
 import scala.meta.internal.metals.config.UserConfiguration
 import scala.meta.internal.metals.doctor.Doctor
 import scala.meta.internal.metals.doctor.TargetsInfoProvider
+import scala.meta.internal.metals.utils.LimitedFilesManager
 import scala.meta.io.AbsolutePath
 
 import org.eclipse.lsp4j.Position
@@ -79,6 +85,180 @@ class ReportsSuite extends BaseSuite {
         d.isDirectory() && TimeFormatter.hasDateName(d.getName())
       )
     )
+  }
+
+  test("runtime-report-count-is-bounded-with-first-incident-retained") {
+    val first = reportsProvider.incognito
+      .create(() => exampleReport("first-incident"))
+      .get()
+    (1 to 60).foreach { i =>
+      assert(
+        reportsProvider.incognito
+          .create(() => exampleReport(s"incident-$i"))
+          .isPresent()
+      )
+    }
+    val reports = reportsProvider.incognito.getReports()
+    assertEquals(reports.length, StdReportContext.MAX_NUMBER_OF_REPORTS)
+    assert(
+      Files.exists(first),
+      "automatic retention must preserve first evidence",
+    )
+    assert(reports.exists(_.name.contains("incident-60_")))
+    assertDiskBound(reportsProvider)
+  }
+
+  private def assertDiskBound(context: StdReportContext): Unit = {
+    val files = new LimitedFilesManager(
+      context.incognito.maybeReportsDir,
+      StdReportContext.MAX_NUMBER_OF_REPORTS,
+      ReportFileName.pattern,
+      ".md",
+    ).getAllFiles()
+    assert(files.size <= StdReportContext.MAX_NUMBER_OF_REPORTS)
+    assert(
+      files.forall(file =>
+        Files.size(file.toPath) <= StdReportContext.MAX_REPORT_BYTES
+      )
+    )
+    assert(
+      files.map(file => Files.size(file.toPath)).sum <=
+        StdReportContext.MAX_NUMBER_OF_REPORTS.toLong * StdReportContext.MAX_REPORT_BYTES
+    )
+  }
+
+  test("runtime-report-bytes-and-utf8-are-bounded") {
+    val path = reportsProvider.incognito
+      .create(() =>
+        Report(
+          "large-incident",
+          "☃😺" * StdReportContext.MAX_REPORT_BYTES,
+          "large",
+        )
+      )
+      .get()
+    val bytes = Files.readAllBytes(path)
+    val text = new String(bytes, StandardCharsets.UTF_8)
+    assert(bytes.length <= StdReportContext.MAX_REPORT_BYTES)
+    assert(text.contains("metals-report-retention.v1: report truncated"))
+    assert(!text.contains('\ufffd'))
+    val status =
+      reportsProvider.incognito.maybeReportsDir.resolve("retention-status.txt")
+    assert(Files.size(status) < 512)
+    assert(
+      new String(Files.readAllBytes(status), StandardCharsets.UTF_8)
+        .contains("truncated=1")
+    )
+    assertDiskBound(reportsProvider)
+  }
+
+  test("runtime-report-id-can-be-recreated-after-eviction") {
+    def create(id: String): Path = reportsProvider.incognito
+      .create(() =>
+        Report("same-name", "incident", "summary", id = Optional.of(id))
+      )
+      .get()
+    val first = create("first")
+    val evicted = create("evicted")
+    (1 to 40).foreach(i => create(s"id-$i"))
+    assert(Files.exists(first))
+    assert(!Files.exists(evicted))
+    val recreated = create("evicted")
+    assert(recreated != evicted)
+    assert(Files.exists(recreated))
+    assertEquals(create("evicted"), recreated)
+    assertDiskBound(reportsProvider)
+  }
+
+  test("runtime-report-writers-share-inventory-without-overwriting") {
+    val other = new StdReportContext(workspace.toNIO, _ => None)
+    val pool = Executors.newFixedThreadPool(4)
+    try {
+      val pending = (1 to 80).map { i =>
+        pool.submit(new Callable[Path] {
+          override def call(): Path = {
+            val context = if (i % 2 == 0) reportsProvider else other
+            context.incognito
+              .create(() =>
+                Report(
+                  "same-name",
+                  s"incident-$i",
+                  "summary",
+                  id = Optional.of(s"id-$i"),
+                )
+              )
+              .get()
+          }
+        })
+      }
+      val paths = pending.map(_.get(30, TimeUnit.SECONDS))
+      assertEquals(paths.distinct.size, 80)
+      assertEquals(
+        other.incognito.getReports().size,
+        StdReportContext.MAX_NUMBER_OF_REPORTS,
+      )
+      assertEquals(
+        other.incognito.getReports(),
+        reportsProvider.incognito.getReports(),
+      )
+      assertDiskBound(reportsProvider)
+    } finally {
+      pool.shutdownNow()
+      assert(pool.awaitTermination(30, TimeUnit.SECONDS))
+    }
+  }
+
+  test("startup-reports-are-count-and-byte-bounded-before-id-loading") {
+    val root = Files.createTempDirectory("metals-report-retention-startup-")
+    try {
+      val directory = root
+        .resolve(StdReportContext.reportsDir)
+        .resolve("metals")
+        .resolve("2026-01-01")
+      Files.createDirectories(directory)
+      val payload =
+        ("error id: first\n" + "x" * (StdReportContext.MAX_REPORT_BYTES + 1))
+          .getBytes(StandardCharsets.UTF_8)
+      (0 until 60).foreach { i =>
+        Files.write(
+          directory.resolve(f"r_old-incident_00-00-00-$i%03d.md"),
+          payload,
+        )
+      }
+      val context = new StdReportContext(root, _ => None)
+      val reports = context.incognito.getReports()
+      assertEquals(reports.size, StdReportContext.MAX_NUMBER_OF_REPORTS)
+      val first = directory.resolve("r_old-incident_00-00-00-000.md")
+      assert(Files.exists(first))
+      assertDiskBound(context)
+      assert(
+        reports.forall(report =>
+          new String(Files.readAllBytes(report.toPath), StandardCharsets.UTF_8)
+            .contains("report truncated")
+        )
+      )
+      context.deleteAll()
+      assertEquals(context.incognito.getReports().size, 0)
+    } finally RecursivelyDelete(AbsolutePath(root))
+  }
+
+  test("report-io-failure-does-not-poison-duplicate-id") {
+    val root = Files.createTempDirectory("metals-report-retention-failure-")
+    try {
+      val context = new StdReportContext(root, _ => None)
+      val blocker = context.incognito.maybeReportsDir
+      Files.createDirectories(blocker.getParent)
+      Files.write(blocker, Array[Byte](1))
+      def create() = context.incognito.create(() =>
+        Report("incident", "text", "summary", id = Optional.of("retry-id"))
+      )
+      assert(!create().isPresent())
+      Files.delete(blocker)
+      val retry = create()
+      assert(retry.isPresent())
+      assert(Files.exists(retry.get()))
+      assertEquals(create(), retry)
+    } finally RecursivelyDelete(AbsolutePath(root))
   }
 
   test("get-name-summary-and-buildTarget") {

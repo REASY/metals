@@ -1,9 +1,10 @@
 package scala.meta.internal.metals.logging
 
+import java.io.OutputStream
 import java.io.PrintStream
+import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
-import java.nio.file.StandardOpenOption
 
 import scala.util.control.NonFatal
 
@@ -15,13 +16,14 @@ import scala.meta.io.AbsolutePath
 import scala.meta.io.RelativePath
 
 import scribe._
-import scribe.file.FileWriter
-import scribe.file.PathBuilder
 import scribe.format.Formatter
 import scribe.format.FormatterInterpolator
 import scribe.format.date
 import scribe.format.levelPaddedRight
 import scribe.format.messages
+import scribe.output.LogOutput
+import scribe.output.format.OutputFormat
+import scribe.writer.Writer
 
 object MetalsLogger {
 
@@ -60,21 +62,18 @@ object MetalsLogger {
     List(logfile)
   )
 
-  def redirectSystemOut(logfiles: List[AbsolutePath]): Unit = {
-    logfiles.foreach(logfile =>
-      Files.createDirectories(logfile.toNIO.getParent)
-    )
-    val logStreams = logfiles.map(logfile =>
-      Files.newOutputStream(
-        logfile.toNIO,
-        StandardOpenOption.APPEND,
-        StandardOpenOption.CREATE,
-      )
-    )
+  def redirectSystemOut(logfiles: List[AbsolutePath]): Unit =
+    redirectSystemOut(logfiles, MetalsServerConfig.default)
+
+  private def redirectSystemOut(
+      logfiles: List[AbsolutePath],
+      config: MetalsServerConfig,
+  ): Unit = {
+    val logStreams = logfiles.map(newLogStream(_, config))
     val out = new PrintStream(new MutipleOutputsStream(logStreams))
     System.setOut(out)
     System.setErr(out)
-    configureRootLogger(logfiles)
+    configureRootLogger(logStreams)
   }
 
   def configureFileLogging(logfile: AbsolutePath): Unit =
@@ -84,17 +83,19 @@ object MetalsLogger {
     logfiles.foreach(logfile =>
       Files.createDirectories(logfile.toNIO.getParent)
     )
-    configureWithFileHandlers(logfiles).replace()
+    configureWithFileHandlers(
+      logfiles.map(newLogStream(_, MetalsServerConfig.default))
+    ).replace()
   }
 
   private def configureWithFileHandlers(
-      logfiles: List[AbsolutePath]
+      logStreams: List[OutputStream]
   ): Logger = {
-    logfiles.foldLeft(
+    logStreams.foldLeft(
       Logger.root.clearModifiers().clearHandlers()
-    ) { (logger, logfile) =>
+    ) { (logger, logStream) =>
       logger.withHandler(
-        writer = newFileWriter(logfile),
+        writer = streamWriter(logStream),
         formatter = defaultFormat,
         minimumLevel = Some(level),
         modifiers = List(MetalsFilter()),
@@ -102,8 +103,8 @@ object MetalsLogger {
     }
   }
 
-  private def configureRootLogger(logfiles: List[AbsolutePath]): Unit = {
-    configureWithFileHandlers(logfiles)
+  private def configureRootLogger(logStreams: List[OutputStream]): Unit = {
+    configureWithFileHandlers(logStreams)
       .withHandler(
         writer = LanguageClientLogger,
         formatter = MetalsLogger.defaultFormat,
@@ -121,7 +122,7 @@ object MetalsLogger {
     val newLogFiles = folders.map(backUpOldLogFileIfTooBig(_, config))
     logInfoInProdDebugInTests(s"logging to files ${newLogFiles.mkString(",")}")
     if (redirectSystemStreams) {
-      redirectSystemOut(newLogFiles)
+      redirectSystemOut(newLogFiles, config)
     } else {
       Logger.root
         .clearModifiers()
@@ -180,8 +181,35 @@ object MetalsLogger {
     new LimitedFilesManager(backupDir.toNIO, limit, "log_".r, "").deleteOld()
   }
 
-  def newFileWriter(logfile: AbsolutePath): FileWriter =
-    FileWriter(pathBuilder = PathBuilder.static(logfile.toNIO)).flushAlways
+  private def newLogStream(
+      logfile: AbsolutePath,
+      config: MetalsServerConfig,
+  ): RuntimeLogOutputStream =
+    new RuntimeLogOutputStream(
+      logfile.toNIO,
+      config.maxLogFileSize,
+      config.maxLogBackups,
+    )
+
+  def newFileWriter(logfile: AbsolutePath): Writer =
+    streamWriter(newLogStream(logfile, MetalsServerConfig.default))
+
+  private[metals] def streamWriter(stream: OutputStream): Writer = new Writer {
+    override def write(
+        record: LogRecord,
+        output: LogOutput,
+        outputFormat: OutputFormat,
+    ): Unit = {
+      val bytes = (output.plainText + System.lineSeparator()).getBytes(UTF_8)
+      stream match {
+        case runtime: RuntimeLogOutputStream
+            if record.level >= Level.Error.value =>
+          runtime.writeErrorRecord(bytes)
+        case _ => stream.write(bytes)
+      }
+      stream.flush()
+    }
+  }
 
   def defaultFormat: Formatter = formatter"$date $levelPaddedRight $messages"
 

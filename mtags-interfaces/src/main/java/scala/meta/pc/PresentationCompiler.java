@@ -222,6 +222,13 @@ public abstract class PresentationCompiler {
     return false;
   }
 
+  /** Experimental constructor selections from typed invocations, never class navigation. */
+  public CompletableFuture<ScalaConstructorEvidence> scalaConstructorEvidence(
+      VirtualFileParams params) {
+    return CompletableFuture.completedFuture(
+        ScalaConstructorEvidence.unavailable(params.uri().toString(), "", "UNSUPPORTED_COMPILER"));
+  }
+
   /**
    * Returns the Protobuf byte array representation of a SemanticDB <code>TextDocument</code> for
    * the given source.

@@ -15,7 +15,6 @@ import scala.reflect.internal.util.ScriptSourceFile
 import scala.reflect.internal.util.SourceFile
 import scala.reflect.internal.{Flags => gf}
 import scala.reflect.io.AbstractFile
-import scala.reflect.io.VirtualFile
 import scala.tools.nsc.LogicalPackage
 import scala.tools.nsc.MetalsJavaPlatform
 import scala.tools.nsc.Mode
@@ -99,6 +98,14 @@ class MetalsGlobal(
   } with m.internal.pc.classpath.MetalsBrowsingLoaders
 
   val compileUnitsCache = new CompileUnitsCache(5)
+  private val evictedCompilationUnits = mutable.Set.empty[String]
+
+  // Keep the unmarked document text with the cached unit: moving a completion
+  // cursor changes the synthetic source but must not invalidate typer state.
+  private class BufferCompilationUnit(
+      source: SourceFile,
+      val documentText: String
+  ) extends RichCompilationUnit(source)
   def didChange(uri: URI): Unit = {
     compileUnitsCache.didChange(uri)
   }
@@ -190,10 +197,46 @@ class MetalsGlobal(
 
   def semanticdbSymbol(symbol: Symbol): String = {
     import semanticdbOps._
-    val semantic = symbol.toSemantic
-    if (symbol == null) ""
-    else if (semantic.isEmpty()) symbol.nameString
-    else semantic
+    val canonical = Option(symbol).flatMap(currentOverload)
+    canonical.fold("") { current =>
+      val semantic = current.toSemantic
+      if (semantic.isEmpty()) current.nameString
+      else semantic
+    }
+  }
+
+  private def currentOverload(selected: Symbol): Option[Symbol] = {
+    import semanticdbOps._
+    if (
+      !selected.isMethod || selected.isOverloaded || !selected.isSemanticdbGlobal
+    ) Some(selected)
+    else {
+      val peers = selected.owner.info
+        .decl(selected.name)
+        .alternatives
+        .filter(peer => peer.isMethod && !peer.isValMethod)
+      if (peers.size > 1 && !peers.contains(selected)) {
+        // Typing dependency source can replace the owner's declarations while
+        // cached caller trees retain a binary method symbol. Rebind only
+        // through unique compiler type equality in the same owner.
+        try {
+          val selectedType = selected.info
+          val matching = peers.filter { peer =>
+            val currentType = peer.info
+            selectedType.isDefined && currentType.isDefined &&
+            (selectedType =:= currentType)
+          }
+          matching match {
+            case current :: Nil => Some(current)
+            case _ => None
+          }
+        } catch {
+          // An unprovable orphan must not reach SemanticDB's first-overload
+          // fallback. Owner/declaration lookup failures remain visible above.
+          case NonFatal(_) => None
+        }
+      } else Some(selected)
+    }
   }
 
   def pretty(pos: Position): String = {
@@ -787,7 +830,7 @@ class MetalsGlobal(
   private def remove(filename: String): Unit = {
     if (!richCompilationCache.contains(filename)) {
       fullyCompiled.remove(filename)
-      toBeRemoved.add(new VirtualFile(filename))
+      toBeRemoved.add(MetalsSourceFile.file(filename))
     }
   }
 
@@ -814,13 +857,40 @@ class MetalsGlobal(
       new MetalsSourceFile(filename, codeWithCursor.toCharArray)
     )
 
+    // Replaced source symbols invalidate dependent nested-type signatures.
+    // An eviction affects this request only if it re-enters the evicted file.
+    val changedSource = unitOfFile.get(unit.source.file).exists {
+      case previous: BufferCompilationUnit => previous.documentText != code
+      case previous =>
+        val unmarkedSource =
+          if (cursor.isDefined) new MetalsSourceFile(filename, code.toCharArray)
+          else unit.source
+        !util.Arrays.equals(previous.source.content, unmarkedSource.content)
+    }
+    val reenteredEvictedUnit = evictedCompilationUnits.remove(filename)
+    val previousRun = currentRun
+    if (reenteredEvictedUnit || changedSource) {
+      newTyperRun()
+    }
+
     val source =
       if (filename.isScalaScript || filename.isSbt || filename.isMill)
         ScriptSourceFile(unit.source.file, unit.source.content)
       else unit.source
-    val richUnit = new RichCompilationUnit(source)
+    val richUnit = new BufferCompilationUnit(source, code)
+    // An explicitly queried document must be fully typed even when an earlier
+    // request loaded and pruned it through the source path. A pruned SemanticDB
+    // request re-registers the unit after addCompilationUnit returns.
+    if (!isOutline) {
+      PruneLateSourcesComponent.loadedFromSource.remove(source.file)
+    }
     if (!isOutline && !willBeRemovedAfterUsing) {
-      compileUnitsCache.didGetUnit(filename).foreach(remove)
+      compileUnitsCache.didGetUnit(filename).foreach { expired =>
+        if (!richCompilationCache.contains(expired)) {
+          evictedCompilationUnits.add(expired)
+        }
+        remove(expired)
+      }
     }
     toBeRemoved.remove(richUnit.source.file)
     unitOfFile.get(richUnit.source.file) match {
@@ -833,15 +903,34 @@ class MetalsGlobal(
       case maybeOldUnit =>
         unitOfFile(richUnit.source.file) = richUnit
 
-        maybeOldUnit.foreach { _ =>
-          currentRun.symSource.foreach { case (sym, _) =>
-            // otherwise we seem to be getting stale symbol completions for toplevels
-            if (sym.owner.hasPackageFlag && sym.isStale) {
+        maybeOldUnit.foreach { oldUnit =>
+          def unlinkStale(sym: Symbol): Unit = {
+            if (
+              sym != null && sym != NoSymbol && sym.owner.hasPackageFlag && sym.isStale
+            ) {
               sym.owner.info.decls unlink sym
             }
           }
+          previousRun.symSource.keys.foreach(unlinkStale)
+          // Intervening edits can rotate symSource without recompiling this
+          // file. Its cached trees still identify the declarations to unlink,
+          // without retaining another registry of symbols across typer runs.
+          def unlinkDeclarations(tree: Tree): Unit = tree match {
+            case PackageDef(_, stats) => stats.foreach(unlinkDeclarations)
+            case definition: ImplDef => unlinkStale(definition.symbol)
+            case _ =>
+          }
+          unlinkDeclarations(oldUnit.body)
+          if (oldUnit.lastBody ne oldUnit.body) {
+            unlinkDeclarations(oldUnit.lastBody)
+          }
         }
-
+        // A source-path unit can have symbols without an interactive unit.
+        // Re-enter generated companions when replacing its source.
+        val replacedSymbols = currentRun.symSource.collect {
+          case (sym, file) if file == source.file => sym
+        }
+        replacedSymbols.foreach(currentRun.symSource.remove)
         if (!isOutline) {
           fullyCompiled += filename
         } else {

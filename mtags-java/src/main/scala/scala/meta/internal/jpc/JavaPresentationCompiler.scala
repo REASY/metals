@@ -366,6 +366,126 @@ case class JavaPresentationCompiler(
     }
   }
 
+  /** Public-fixture capability prototype; not exposed by MetalsService. */
+  def receiverTypesExperimental(
+      params: util.List[VirtualFileParams]
+  ): CompletableFuture[com.google.gson.JsonObject] = {
+    val inputs = params.asScala.toList
+    val unavailable =
+      JavaReceiverTypeProvider.unavailable(inputs, "UNAVAILABLE")
+    if (inputs.isEmpty) CompletableFuture.completedFuture(unavailable)
+    else
+      request(inputs.head, unavailable) { pc =>
+        val result = new JavaReceiverTypeProvider(pc).documents(inputs)
+        result.addProperty("buildTargetId", buildTargetId)
+        result
+      }
+  }
+
+  /** Source-bound targeted profile; deliberately not exposed by MetalsService. */
+  def receiverTypesAtExperimental(
+      params: util.List[VirtualFileParams],
+      targets: util.List[JavaReceiverTarget]
+  ): CompletableFuture[com.google.gson.JsonObject] =
+    receiverTypesAt(params, targets, retainSelection = false)
+
+  /** Exact receiver type plus independently correlated selected declaration. */
+  def javaReceiverTypes(
+      params: util.List[VirtualFileParams],
+      targets: util.List[JavaReceiverTarget]
+  ): CompletableFuture[com.google.gson.JsonObject] =
+    receiverTypesAt(params, targets, retainSelection = true)
+
+  /** Binary-only capability gate. Not exposed by MetalsService or admitted by Codehop. */
+  def javaDependencyBodiesExperimental(
+      params: util.List[VirtualFileParams],
+      targets: util.List[JavaReceiverTarget],
+      maxInventoryEntries: Int = 8192
+  ): CompletableFuture[com.google.gson.JsonObject] =
+    receiverTypesAt(
+      params,
+      targets,
+      retainSelection = true,
+      dependencyBodyLimit = Some(maxInventoryEntries)
+    )
+
+  /** Selected classfile origins for the separately versioned Metals route. */
+  def javaCompiledOriginsExperimental(
+      params: util.List[VirtualFileParams],
+      targets: util.List[JavaReceiverTarget]
+  ): CompletableFuture[com.google.gson.JsonObject] =
+    receiverTypesAt(
+      params,
+      targets,
+      retainSelection = true,
+      retainOrigin = true
+    )
+
+  private def receiverTypesAt(
+      params: util.List[VirtualFileParams],
+      targets: util.List[JavaReceiverTarget],
+      retainSelection: Boolean,
+      dependencyBodyLimit: Option[Int] = None,
+      retainOrigin: Boolean = false
+  ): CompletableFuture[com.google.gson.JsonObject] = {
+    val schema =
+      if (retainOrigin) "metals-java-compiled-origins.experimental.v1"
+      else if (dependencyBodyLimit.isDefined)
+        "metals-java-dependency-bodies.experimental.v1"
+      else if (retainSelection) JavaReceiverTypeProvider.SemanticSchemaVersion
+      else JavaReceiverTypeProvider.TargetedSchemaVersion
+    def unavailable(reason: String): com.google.gson.JsonObject = {
+      val result = JavaReceiverTypeProvider.unavailable(Nil, reason)
+      result.addProperty("requestedDocumentCount", params.size())
+      result.addProperty(
+        "schemaVersion",
+        schema
+      )
+      result
+    }
+    if (dependencyBodyLimit.exists(limit => limit < 1 || limit > 262144))
+      CompletableFuture.completedFuture(unavailable("INVALID_INVENTORY_BUDGET"))
+    else if (params.size() > JavaReceiverTypeProvider.MaxFiles)
+      CompletableFuture.completedFuture(
+        unavailable("INPUT_LIMIT_OR_DUPLICATE_URI")
+      )
+    else if (
+      targets
+        .size() > JavaReceiverTypeProvider.MaxSites * JavaReceiverTypeProvider.MaxFiles
+    )
+      CompletableFuture.completedFuture(unavailable("TARGET_COUNT_LIMIT"))
+    else if (params.isEmpty())
+      CompletableFuture.completedFuture(unavailable("EMPTY_REQUEST"))
+    else {
+      val inputs = params.asScala.toList
+      val requested = targets.asScala.toList
+      request(inputs.head, unavailable("UNAVAILABLE")) { pc =>
+        JavaReceiverTypeProvider.validateTargets(inputs, requested) match {
+          case Left(reason) => unavailable(reason)
+          case Right(selection) =>
+            val result = new JavaReceiverTypeProvider(pc)
+              .documents(
+                inputs,
+                Some(selection),
+                retainSelection,
+                dependencyBodyLimit,
+                retainOrigin
+              )
+            result.addProperty(
+              "schemaVersion",
+              schema
+            )
+            result.addProperty(
+              "targetRequestSha256",
+              JavaReceiverTypeProvider.targetRequestHash(requested)
+            )
+            result.addProperty("buildTargetId", buildTargetId)
+            result
+        }
+      }
+    }
+  }
+
   override def selectionRange(
       params: util.List[OffsetParams]
   ): CompletableFuture[util.List[SelectionRange]] =

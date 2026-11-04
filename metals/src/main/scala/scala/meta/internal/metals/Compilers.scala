@@ -12,6 +12,7 @@ import scala.annotation.nowarn
 import scala.collection.concurrent.TrieMap
 import scala.concurrent.ExecutionContextExecutorService
 import scala.concurrent.Future
+import scala.concurrent.Promise
 import scala.concurrent.duration.DurationInt
 import scala.concurrent.duration.FiniteDuration
 import scala.util.Failure
@@ -1692,6 +1693,7 @@ class Compilers(
   def loadCompiler(
       path: AbsolutePath,
       forceScala: Boolean = false,
+      requireBuildTargetClasspath: Boolean = false,
   ): Option[PresentationCompiler] = {
 
     def fromBuildTarget: Option[PresentationCompiler] = {
@@ -1701,28 +1703,36 @@ class Compilers(
 
       target match {
         case None =>
-          val tmpDirectory = workspace.resolve(Directories.tmp)
-          val scalaVersion =
-            scalaVersionSelector.fallbackScalaVersion()
-          if (
-            !path.toNIO.startsWith(tmpDirectory.toNIO)
-            // don't spam the log with the same message about the same file
-            && !lastPathWithFallbackCompiler.contains(path)
-          ) {
-            scribe.debug(
-              s"no build target found for $path, try syncing the file for full IDE support." +
-                s" Using presentation compiler with project's scala-library version: ${scalaVersion}"
-            )
-            lastPathWithFallbackCompiler = Some(path)
+          if (requireBuildTargetClasspath) None
+          else {
+            val tmpDirectory = workspace.resolve(Directories.tmp)
+            val scalaVersion =
+              scalaVersionSelector.fallbackScalaVersion()
+            if (
+              !path.toNIO.startsWith(tmpDirectory.toNIO)
+              // don't spam the log with the same message about the same file
+              && !lastPathWithFallbackCompiler.contains(path)
+            ) {
+              scribe.debug(
+                s"no build target found for $path, try syncing the file for full IDE support." +
+                  s" Using presentation compiler with project's scala-library version: ${scalaVersion}"
+              )
+              lastPathWithFallbackCompiler = Some(path)
+            }
+            Some(fallbackCompiler(path))
           }
-          Some(fallbackCompiler(path))
         case Some(value) =>
           if (path.isScalaFilename)
-            Some(loadCompiler(value).getOrElse(fallbackCompiler(path)))
+            loadCompiler(value, requireBuildTargetClasspath)
+              .orElse {
+                if (requireBuildTargetClasspath) None
+                else Some(fallbackCompiler(path))
+              }
           else if (path.isJavaFilename && forceScala)
-            loadCompiler(value)
-              .orElse(loadJavaCompiler(value))
-          else if (path.isJavaFilename) loadJavaCompiler(value)
+            loadCompiler(value, requireBuildTargetClasspath)
+              .orElse(loadJavaCompiler(value, requireBuildTargetClasspath))
+          else if (path.isJavaFilename)
+            loadJavaCompiler(value, requireBuildTargetClasspath)
           else None
       }
     }
@@ -1840,10 +1850,11 @@ class Compilers(
   }
 
   private def loadJavaCompiler(
-      targetId: BuildTargetIdentifier
+      targetId: BuildTargetIdentifier,
+      requireBuildTargetClasspath: Boolean = false,
   ): Option[PresentationCompiler] = {
     buildTargets.jvmTarget(targetId, scalaPreferred = false).map { javaTarget =>
-      jcache
+      val compiler = jcache
         .computeIfAbsent(
           PresentationCompilerKey.JavaBuildTarget(targetId),
           { _ =>
@@ -1854,7 +1865,14 @@ class Compilers(
             }
           },
         )
-        .await
+      if (requireBuildTargetClasspath)
+        compiler.awaitBuildTargetCompiler(
+          scala.concurrent.duration.Duration(
+            config.initialConfig.compilers.timeoutDelay,
+            config.initialConfig.compilers.timeoutUnit,
+          )
+        )
+      else compiler.await
     }
   }
 
@@ -1884,6 +1902,12 @@ class Compilers(
   private def loadCompiler(
       targetId: BuildTargetIdentifier
   ): Option[PresentationCompiler] =
+    loadCompiler(targetId, requireBuildTargetClasspath = false)
+
+  private def loadCompiler(
+      targetId: BuildTargetIdentifier,
+      requireBuildTargetClasspath: Boolean,
+  ): Option[PresentationCompiler] =
     withKeyAndDefault(targetId) { case (key, getCompiler) =>
       def loadInitialFiles(pc: PresentationCompiler): PresentationCompiler = {
         val sources = buildTargets.buildTargetSources(targetId)
@@ -1903,9 +1927,17 @@ class Compilers(
 
       // in case of a restart, the presentation compiler should know all files that have been modified
       // and use their up to date contents when type checking
-      val pc = jcache
+      val compiler = jcache
         .computeIfAbsent(key, { _ => newCompiler = true; getCompiler() })
-        .await
+      val pc =
+        if (requireBuildTargetClasspath)
+          compiler.awaitBuildTargetCompiler(
+            scala.concurrent.duration.Duration(
+              config.initialConfig.compilers.timeoutDelay,
+              config.initialConfig.compilers.timeoutUnit,
+            )
+          )
+        else compiler.await
       Option(if (newCompiler) loadInitialFiles(pc) else pc)
     }
 
@@ -2224,14 +2256,259 @@ class Compilers(
     debugItem
   }
 
+  /** Acquire receiver and selected-callable evidence in the evaluated Java target. */
+  def javaReceiverTypes(
+      params: JavaReceiverTypesParams,
+      cancelToken: CancelToken,
+      dependencyParams: Option[JavaDependencyBodiesParams] = None,
+      compiledOrigins: Boolean = false,
+  ): Future[com.google.gson.JsonObject] = {
+    import scala.meta.internal.jpc.JavaPresentationCompiler
+    import scala.meta.internal.jpc.JavaReceiverTarget
+
+    def unavailable(reason: String) =
+      Future.successful(
+        if (compiledOrigins) JavaCompiledOrigins.unavailable(reason)
+        else if (dependencyParams.isDefined)
+          JavaDependencyBodies.unavailable(reason)
+        else JavaReceiverTypes.unavailable(reason)
+      )
+
+    if (
+      !JavaReceiverTypes.valid(params) ||
+      (compiledOrigins && dependencyParams.isDefined) ||
+      dependencyParams.exists(p =>
+        !JavaDependencyBodies.valid(p) || p.receiverParams != params
+      )
+    ) unavailable("INVALID_REQUEST")
+    else {
+      val path = params.uri.toAbsolutePath
+      val targetId = new BuildTargetIdentifier(params.buildTargetId)
+      val target = buildTargets.javaTarget(targetId)
+      if (!buildTargets.inverseSourcesAll(path).contains(targetId))
+        unavailable("BUILD_TARGET_MISMATCH")
+      else
+        target match {
+          case Some(javaTarget)
+              if javaTarget.options.size > 256 || javaTarget.options.exists(
+                _.length > 4096
+              ) =>
+            unavailable("EVALUATED_JAVA_OPTIONS_OVERSIZE")
+          case Some(javaTarget) if javaTarget.releaseVersion.nonEmpty =>
+            buildTargets.targetClasspath(targetId, Promise[Unit]()) match {
+              case None => unavailable("BUILD_TARGET_CLASSPATH_UNAVAILABLE")
+              case Some(classpath) =>
+                classpath.flatMap { _ =>
+                  cancelToken.checkCanceled()
+                  if (
+                    !path.isFile || java.nio.file.Files.size(
+                      path.toNIO
+                    ) > JavaReceiverTypes.MaxSourceBytes
+                  )
+                    unavailable("SOURCE_UNAVAILABLE_OR_OVERSIZE")
+                  else {
+                    val text = path.toInputFromBuffers(buffers).text
+                    if (text.length > JavaReceiverTypes.MaxSourceBytes)
+                      unavailable("SOURCE_UNAVAILABLE_OR_OVERSIZE")
+                    else
+                      loadJavaCompiler(
+                        targetId,
+                        requireBuildTargetClasspath = true,
+                      ) match {
+                        case Some(pc: JavaPresentationCompiler)
+                            if (dependencyParams.isDefined || compiledOrigins) &&
+                              (pc.classpath.size > 4096 ||
+                                pc.classpath
+                                  .map(_.toString.length.toLong)
+                                  .sum > 128 * 1024) =>
+                          unavailable("CLASSPATH_IDENTITY_BUDGET")
+                        case Some(pc: JavaPresentationCompiler)
+                            if dependencyParams.exists(p =>
+                              p.phase == "ACQUIRE" && p.compilerClasspathSha256 !=
+                                JavaReceiverTypes.optionsHash(
+                                  pc.classpath
+                                    .map(
+                                      _.toAbsolutePath.normalize().toString
+                                    )
+                                    .toList
+                                )
+                            ) =>
+                          unavailable("CLASSPATH_CHANGED")
+                        case Some(pc: JavaPresentationCompiler) =>
+                          // A separate receiver compiler takes evaluated javac options even
+                          // for mixed Scala targets. Never mutate the feature-gated PC.
+                          JavaReceiverTypes.compilerOptions(
+                            javaTarget.options
+                          ) match {
+                            case Left(reason) => unavailable(reason)
+                            case Right(options) =>
+                              val owned = pc.copy(options = options)
+                              val input: VirtualFileParams =
+                                CompilerVirtualFileParams(
+                                  path.toURI,
+                                  text,
+                                  token = cancelToken,
+                                )
+                              val targets = params.targets.asScala.map {
+                                range =>
+                                  JavaReceiverTarget(
+                                    path.toURI,
+                                    params.sourceSha256,
+                                    range.startUtf16,
+                                    range.endUtf16,
+                                  )
+                              }
+                              val acquired = dependencyParams match {
+                                case Some(dependency) =>
+                                  JavaDependencyContext.run(
+                                    dependency,
+                                    owned.classpath,
+                                    text,
+                                    cancelToken,
+                                  ) {
+                                    owned
+                                      .javaDependencyBodiesExperimental(
+                                        List(input).asJava,
+                                        targets.asJava,
+                                        dependency.maxInventoryEntries,
+                                      )
+                                      .asScala
+                                  }
+                                case None =>
+                                  if (compiledOrigins)
+                                    JavaDependencyContext.runCompiled(
+                                      params.sourceSha256,
+                                      owned.classpath,
+                                      text,
+                                      cancelToken,
+                                    ) {
+                                      val before = JavaCompiledOrigins.capture(
+                                        buildTargets,
+                                        targetId,
+                                        cancelToken,
+                                      )
+                                      owned
+                                        .javaCompiledOriginsExperimental(
+                                          List(input).asJava,
+                                          targets.asJava,
+                                        )
+                                        .asScala
+                                        .map { response =>
+                                          JavaCompiledClassfiles.enrich(
+                                            JavaCompiledOrigins.correlate(
+                                              response,
+                                              before,
+                                              JavaCompiledOrigins.capture(
+                                                buildTargets,
+                                                targetId,
+                                                cancelToken,
+                                              ),
+                                            ),
+                                            owned.classpath,
+                                            cancelToken,
+                                          )
+                                        }
+                                    }
+                                  else
+                                    owned
+                                      .javaReceiverTypes(
+                                        List(input).asJava,
+                                        targets.asJava,
+                                      )
+                                      .asScala
+                              }
+                              acquired
+                                .map { result =>
+                                  val evaluatedOptions =
+                                    new com.google.gson.JsonArray()
+                                  javaTarget.options.foreach(
+                                    evaluatedOptions.add
+                                  )
+                                  result.add(
+                                    "evaluatedCompilerOptions",
+                                    evaluatedOptions,
+                                  )
+                                  result.addProperty(
+                                    "javaRelease",
+                                    javaTarget.releaseVersion.getOrElse(""),
+                                  )
+                                  result.addProperty(
+                                    "compilerOptionsSha256",
+                                    JavaReceiverTypes
+                                      .optionsHash(options),
+                                  )
+                                  result.addProperty(
+                                    "evaluatedCompilerOptionsSha256",
+                                    JavaReceiverTypes
+                                      .optionsHash(javaTarget.options),
+                                  )
+                                  result.addProperty(
+                                    "compilerOptionsProfile",
+                                    JavaReceiverTypes.OptionsProfile,
+                                  )
+                                  dependencyParams.foreach { dependency =>
+                                    result.addProperty(
+                                      "schemaVersion",
+                                      JavaDependencyBodies.SchemaVersion,
+                                    )
+                                    val entries = owned.classpath.map(
+                                      _.toAbsolutePath.normalize().toString
+                                    )
+                                    val values = new com.google.gson.JsonArray()
+                                    entries.foreach(values.add)
+                                    result.add("compilerClasspath", values)
+                                    result.addProperty(
+                                      "compilerClasspathSha256",
+                                      JavaReceiverTypes
+                                        .optionsHash(entries.toList),
+                                    )
+                                    result.addProperty(
+                                      "inventoryLimit",
+                                      dependency.maxInventoryEntries,
+                                    )
+                                  }
+                                  if (
+                                    evaluatedOptions.toString
+                                      .getBytes(
+                                        java.nio.charset.StandardCharsets.UTF_8
+                                      )
+                                      .length > 16 * 1024
+                                  )
+                                    if (compiledOrigins)
+                                      JavaCompiledOrigins.unavailable(
+                                        "EVALUATED_JAVA_OPTIONS_OVERSIZE"
+                                      )
+                                    else if (dependencyParams.isDefined)
+                                      JavaDependencyBodies.unavailable(
+                                        "EVALUATED_JAVA_OPTIONS_OVERSIZE"
+                                      )
+                                    else
+                                      JavaReceiverTypes.unavailable(
+                                        "EVALUATED_JAVA_OPTIONS_OVERSIZE"
+                                      )
+                                  else result
+                                }
+                                .andThen { case _ => owned.shutdown() }
+                          }
+                        case _ => unavailable("JAVA_COMPILER_UNAVAILABLE")
+                      }
+                  }
+                }
+            }
+          case _ => unavailable("EVALUATED_JAVA_RELEASE_UNAVAILABLE")
+        }
+    }
+  }
+
   /**
    * Batch the semanticdb text documents for the given sources.
    *
    * @param sources list of sources to process
    * @param cancelToken cancel token to cancel the operation
    * @param timeout timeout after which partial results may be returned
-   * @param useFallbackCompiler  use fallback compiler to avoid starting many presentation compilers
-   * @param shouldPruneSemanticdb whether to prune semanticdb, set if only interested in public symbols
+   * @param useFallbackCompiler use fallback compiler to avoid starting many presentation compilers
+   * @param requireBuildTargetClasspath wait for owning build targets' classpaths
+   * @param shouldPruneSemanticdb whether to prune semanticdb for public symbols
    * @return Future[s.TextDocuments] containing the semanticdb text documents
    */
   def batchSemanticdbTextDocuments(
@@ -2239,94 +2516,163 @@ class Compilers(
       cancelToken: CancelToken,
       timeout: Duration,
       useFallbackCompiler: Boolean,
+      requireBuildTargetClasspath: Boolean = false,
       shouldPruneSemanticdb: Boolean = false,
   ): Future[s.TextDocuments] = {
     def getCompiler(path: AbsolutePath): Option[PresentationCompiler] =
       if (useFallbackCompiler && path.isScalaOrJava)
         Some(fallbackCompilerForTarget(path))
       else
-        loadCompiler(path)
+        loadCompiler(
+          path,
+          requireBuildTargetClasspath = requireBuildTargetClasspath,
+        )
 
-    val futures = for {
-      (pc, paths) <- sources
-        .flatMap(s => getCompiler(s).map(pc => (pc, s)))
-        .groupBy(_._1)
-    } yield {
-      val params: Seq[(VirtualFileParams, AdjustLspData, AbsolutePath)] =
-        paths.map { case (_, path) =>
+    val classpathReadiness =
+      if (requireBuildTargetClasspath) {
+        Future.sequence(sources.distinct.flatMap { source =>
+          buildTargets
+            .inverseSources(source)
+            .orElse(protoGeneratedJavaTarget(source))
+            .flatMap(target =>
+              buildTargets.targetClasspath(target, Promise[Unit]())
+            )
+        })
+      } else Future.successful(Nil)
 
-          val (input, _, adjust) =
-            sourceMapper.pcMapping(path, pc.scalaVersion())
-          val params = CompilerVirtualFileParams(
-            path.toURI,
-            input.value,
-            token = cancelToken,
-            shouldReturnDiagnostics = true,
-            shouldPruneSemanticdb = shouldPruneSemanticdb,
-          )
-          (params: VirtualFileParams, adjust, path)
+    classpathReadiness.flatMap { _ =>
+      val futures = for {
+        (pc, paths) <- sources
+          .flatMap(s => getCompiler(s).map(pc => (pc, s)))
+          .groupBy(_._1)
+      } yield {
+        val params: Seq[(VirtualFileParams, AdjustLspData, AbsolutePath)] =
+          paths.map { case (_, path) =>
+
+            val (input, _, adjust) =
+              sourceMapper.pcMapping(path, pc.scalaVersion())
+            val params = CompilerVirtualFileParams(
+              path.toURI,
+              input.value,
+              token = cancelToken,
+              shouldReturnDiagnostics = true,
+              shouldPruneSemanticdb = shouldPruneSemanticdb,
+            )
+            (params: VirtualFileParams, adjust, path)
+          }
+
+        if (pc.supportsBatchSemanticdbTextDocuments()) {
+          val mapping = params.flatMap {
+            // noop for normal files
+            case (_, DefaultAdjustedData, _) =>
+              None
+            case (param, adjust, path) =>
+              Some(
+                param.uri.toString() -> (
+                  adjust,
+                  path.toInputFromBuffers(buffers).value,
+                )
+              )
+          }.toMap
+
+          pc.batchSemanticdbTextDocuments(params.map(_._1).asJava, timeout)
+            .asScala
+            .map(bytes =>
+              s.TextDocuments.parseFrom(bytes).documents.map { case doc =>
+                mapping
+                  .get(doc.uri.toString())
+                  .map { case (adjust, originalText) =>
+                    adjust.adjustTextDocument(doc, originalText)
+                  }
+                  .getOrElse(doc)
+              }
+            )
+        } else {
+          val all = for {
+            (param, adjust, path) <- params
+            doc = pc.semanticdbTextDocument(param)
+          } yield doc.asScala.map { d =>
+            val textDoc = s.TextDocument.parseFrom(d)
+            adjust.adjustTextDocument(
+              textDoc,
+              path.toInputFromBuffers(buffers).value,
+            )
+          }
+          Future.sequence(all).map { parsedDocs =>
+            val targetRoot = buildTargets
+              .jvmTarget(
+                new BuildTargetIdentifier(pc.buildTargetId())
+              )
+              .flatMap(_.getTargetroot)
+              .getOrElse(workspace)
+
+            parsedDocs
+              .map { d =>
+                if (d.uri.startsWith("file:") || d.uri.startsWith("jar:"))
+                  d
+                else
+                  d.withUri(targetRoot.resolve(d.uri).toURI.toString())
+              }
+          }
         }
+      }
+      Future
+        .sequence(futures)
+        .map { docss =>
+          s.TextDocuments(documents = docss.flatten.toSeq)
+        }
+    }
+  }
 
-      if (pc.supportsBatchSemanticdbTextDocuments()) {
-        val mapping = params.flatMap {
-          // noop for normal files
-          case (_, DefaultAdjustedData, _) =>
-            None
-          case (param, adjust, path) =>
-            Some(
-              param.uri.toString() -> (
-                adjust,
-                path.toInputFromBuffers(buffers).value,
+  /** Experimental constructor export: owning build compiler only, no fallback. */
+  def scalaConstructorEvidence(
+      sources: Seq[AbsolutePath],
+      cancelToken: CancelToken,
+  ): Future[Seq[scala.meta.pc.ScalaConstructorEvidence]] = {
+    val readiness = sources.distinct.flatMap { source =>
+      buildTargets
+        .inverseSources(source)
+        .flatMap(target =>
+          buildTargets.targetClasspath(target, Promise[Unit]())
+        )
+    }
+    Future.sequence(readiness).flatMap { _ =>
+      cancelToken.checkCanceled()
+      Future.sequence(sources.map { source =>
+        loadCompiler(source, requireBuildTargetClasspath = true) match {
+          case Some(pc) =>
+            val text = source.toInputFromBuffers(buffers).text
+            if (
+              text
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                .length > 4 * 1024 * 1024
+            )
+              Future.successful(
+                scala.meta.pc.ScalaConstructorEvidence.unavailable(
+                  source.toURI.toString,
+                  "",
+                  "SOURCE_BOUND",
+                )
+              )
+            else
+              pc.scalaConstructorEvidence(
+                CompilerVirtualFileParams(
+                  source.toURI,
+                  text,
+                  token = cancelToken,
+                )
+              ).asScala
+          case None =>
+            Future.successful(
+              scala.meta.pc.ScalaConstructorEvidence.unavailable(
+                source.toURI.toString,
+                "",
+                "BUILD_COMPILER_UNAVAILABLE",
               )
             )
-        }.toMap
-
-        pc.batchSemanticdbTextDocuments(params.map(_._1).asJava, timeout)
-          .asScala
-          .map(bytes =>
-            s.TextDocuments.parseFrom(bytes).documents.map { case doc =>
-              mapping
-                .get(doc.uri.toString())
-                .map { case (adjust, originalText) =>
-                  adjust.adjustTextDocument(doc, originalText)
-                }
-                .getOrElse(doc)
-            }
-          )
-      } else {
-        val all = for {
-          (param, adjust, path) <- params
-          doc = pc.semanticdbTextDocument(param)
-        } yield doc.asScala.map { d =>
-          val textDoc = s.TextDocument.parseFrom(d)
-          adjust.adjustTextDocument(
-            textDoc,
-            path.toInputFromBuffers(buffers).value,
-          )
         }
-        Future.sequence(all).map { parsedDocs =>
-          val targetRoot = buildTargets
-            .jvmTarget(
-              new BuildTargetIdentifier(pc.buildTargetId())
-            )
-            .flatMap(_.getTargetroot)
-            .getOrElse(workspace)
-
-          parsedDocs
-            .map { d =>
-              if (d.uri.startsWith("file:") || d.uri.startsWith("jar:"))
-                d
-              else
-                d.withUri(targetRoot.resolve(d.uri).toURI.toString())
-            }
-        }
-      }
+      })
     }
-    Future
-      .sequence(futures)
-      .map { docss =>
-        s.TextDocuments(documents = docss.flatten.toSeq)
-      }
   }
 
   def semanticdbTextDocument(

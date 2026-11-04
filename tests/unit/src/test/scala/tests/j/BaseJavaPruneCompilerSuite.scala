@@ -2,6 +2,7 @@ package tests.j
 
 import java.nio.file.Path
 import java.nio.file.Paths
+import javax.tools.Diagnostic
 
 import scala.meta.inputs.Input
 import scala.meta.internal.jpc.JavaDiagnosticProvider
@@ -47,6 +48,7 @@ abstract class BaseJavaPruneCompilerSuite extends munit.FunSuite {
   case class CompileFilesResult(
       diagnostics: List[l.Diagnostic],
       input: Input.VirtualFile,
+      taskErrorCodes: List[String],
   )
   def languages: Set[Semanticdb.Language] =
     Set(Semanticdb.Language.JAVA, Semanticdb.Language.PROTOBUF)
@@ -90,8 +92,15 @@ abstract class BaseJavaPruneCompilerSuite extends munit.FunSuite {
     )
     val params = CompilerVirtualFileParams(uri, text)
     val diagnosticProvider = new JavaDiagnosticProvider(global, params)
-    val diagnostics = diagnosticProvider.diagnostics()
-    CompileFilesResult(diagnostics, input)
+    val compile = global.compileTask(params)
+    try {
+      val diagnostics = diagnosticProvider.diagnostics()
+      val taskErrors = compile.listener.diagnostics.iterator
+        .filter(_.getKind == Diagnostic.Kind.ERROR)
+        .map(_.getCode)
+        .toList
+      CompileFilesResult(diagnostics, input, taskErrors)
+    } finally global.close()
   }
 
   def checkNoErrors(

@@ -6,15 +6,18 @@ import java.util.Optional
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.{util => ju}
+import javax.tools.Diagnostic
 import javax.tools.JavaFileManager
 import javax.tools.JavaFileObject
 import javax.tools.StandardJavaFileManager
+import javax.tools.StandardLocation
 
 import scala.collection.concurrent.TrieMap
 import scala.collection.parallel.mutable.ParArray
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.concurrent.duration.FiniteDuration
+import scala.jdk.OptionConverters._
 import scala.util.control.NonFatal
 
 import scala.meta.internal.jdk.CollectionConverters._
@@ -109,7 +112,65 @@ object TurbineCompiler {
       result.modules(),
       result.classPathEnv(),
     )
-    TurbineCompileResult(boundClasspath, lowered)
+    // Turbine lowers unresolved signature types to Object. Those partial
+    // headers must not shadow target-typed classes or become compiler evidence.
+    // Let javac re-read the original source against its exact target classpath.
+    val errorPaths = log
+      .diagnostics()
+      .asScala
+      .collect {
+        case diagnostic if diagnostic.severity() == Diagnostic.Kind.ERROR =>
+          diagnostic.path()
+      }
+      .toSet
+    val partialSymbols = result
+      .units()
+      .asScala
+      .collect {
+        case (symbol, info) if errorPaths(info.source().path()) => symbol
+      }
+      .toSet
+    val partialBinaryNames = partialSymbols.map(_.binaryName())
+    val completeBytes = ImmutableMap.builder[String, Array[Byte]]()
+    lowered.bytes().asScala.foreach { case (name, bytes) =>
+      if (!partialBinaryNames(name)) completeBytes.put(name, bytes)
+    }
+    val completeSymbols =
+      ImmutableSet.builder[com.google.turbine.binder.sym.ClassSymbol]()
+    lowered.symbols().asScala.foreach { symbol =>
+      if (!partialSymbols(symbol)) completeSymbols.add(symbol)
+    }
+    val sourceFallbacks = units.asScala
+      .filter(unit => errorPaths(unit.source().path()))
+      .map { unit =>
+        val path = Path.of(unit.source().path()).toAbsolutePath.normalize()
+        val packageName = unit
+          .pkg()
+          .toScala
+          .toSeq
+          .flatMap(_.name().asScala.map(_.value()))
+          .mkString("/")
+        val prefix = if (packageName.isEmpty) "" else packageName + "/"
+        val symbols = unit
+          .decls()
+          .asScala
+          .map(decl => prefix + decl.name().value() + "#")
+          .toSeq
+        VirtualTextDocument(
+          path.toUri(),
+          scala.meta.pc.Language.JAVA,
+          unit.source().source(),
+          Seq(prefix),
+          symbols,
+        )
+      }
+      .toSeq
+      .sortBy(_.uri().toString())
+    TurbineCompileResult(
+      boundClasspath,
+      Lower.Lowered.create(completeBytes.build(), completeSymbols.build()),
+      sourceFallbacks,
+    )
   }
   private[mbt] def validClasspaths(classpath: Seq[Path]): Seq[Path] = {
     classpath.filter(isJarFile)
@@ -328,15 +389,25 @@ class TurbineCompiler[T](
 
   def createFileManager(
       underlying: StandardJavaFileManager,
-      projectClasspathJars: ju.List[Path],
+      projectClasspathEntries: ju.List[Path],
   ): JavaFileManager = {
-    val isGlobalClasspathEntry = this.classpath().toSet
-    val projectClasspathEntries =
-      projectClasspathJars.asScala.filter(file =>
-        !isGlobalClasspathEntry(file) && TurbineCompiler.isJarFile(file)
-      )
+    // The compiler's target-scoped classpath is authoritative. A jar may also
+    // occur in the workspace-global Turbine classpath, but the corresponding
+    // Turbine result can still be empty, stale, or built for a different
+    // target when this file manager is created. Keep the target entry here;
+    // TurbineClasspathFileManager already de-duplicates binary names with the
+    // target classpath taking precedence over the global fallback.
+    // Turbine binds jars only. Keep the complete ordered target classpath on
+    // javac's manager so compiled Scala/Java directories are also visible.
+    // Explicitly setting even an empty classpath prevents host-classpath fallback.
+    underlying.setLocationFromPaths(
+      StandardLocation.CLASS_PATH,
+      projectClasspathEntries,
+    )
+    val filteredProjectClasspath =
+      projectClasspathEntries.asScala.filter(TurbineCompiler.isJarFile)
     val projectClasspath =
-      ClassPathBinder.bindClasspath(projectClasspathEntries.asJava)
+      ClassPathBinder.bindClasspath(filteredProjectClasspath.asJava)
     onNewProjectClasspath(projectClasspath)
     new TurbineClasspathFileManager(
       underlying,
@@ -353,7 +424,21 @@ class TurbineCompiler[T](
       packageName: String,
       projectClasspath: ClassPath,
   ): java.lang.Iterable[JavaFileObject] = {
-    val turbineFiles = listSourcepath(packageName)
+    val turbineFiles = new ju.ArrayList[JavaFileObject]()
+    val seen = new ju.HashSet[String]()
+    listSourcepath(packageName).forEach { file =>
+      if (seen.add(file.toUri().toString())) turbineFiles.add(file)
+    }
+    result.sourceFallbacksByPackage.getOrElse(packageName, Nil).foreach {
+      file =>
+        if (
+          !isDeleted(file.binaryName().replace('.', '/')) && seen.add(
+            file.toUri().toString()
+          )
+        ) {
+          turbineFiles.add(file)
+        }
+    }
     val protoPackage = packageName.replace('.', '/') + "/"
     val protoFiles = listProtoJavaOutlinesForPackage(protoPackage).filterNot {
       case file: SemanticdbCompilationUnit =>

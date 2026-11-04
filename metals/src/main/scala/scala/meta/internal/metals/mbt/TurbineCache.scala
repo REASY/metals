@@ -46,7 +46,7 @@ class TurbineCache(
     time: Time,
 ) {
   private val cachePath = workspace.resolve(Directories.turbineCache)
-  private val CacheKeyEntry = "META-INF/turbine-cache-key"
+  private val CacheKeyEntry = "META-INF/turbine-cache-key-v2-complete-outlines"
 
   // we need to always compile on start
   private def isCacheEnabled: Boolean = {
@@ -62,7 +62,11 @@ class TurbineCache(
    * @param result The compilation result to cache
    */
   def writeCache(result: TurbineCompileResult): Unit =
-    if (isCacheEnabled) {
+    if (isCacheEnabled && result.sourceFallbacks.nonEmpty) {
+      // A class-only cache cannot replay the target-dependent source fallbacks.
+      // Do not leave an older complete-looking cache behind for this revision.
+      deleteCache()
+    } else if (isCacheEnabled) {
       val timer = new Timer(time)
       try {
         val bytes = result.lowered.bytes()
