@@ -15,7 +15,6 @@ import scala.reflect.internal.util.ScriptSourceFile
 import scala.reflect.internal.util.SourceFile
 import scala.reflect.internal.{Flags => gf}
 import scala.reflect.io.AbstractFile
-import scala.reflect.io.VirtualFile
 import scala.tools.nsc.LogicalPackage
 import scala.tools.nsc.MetalsJavaPlatform
 import scala.tools.nsc.Mode
@@ -99,6 +98,7 @@ class MetalsGlobal(
   } with m.internal.pc.classpath.MetalsBrowsingLoaders
 
   val compileUnitsCache = new CompileUnitsCache(5)
+  private val evictedCompilationUnits = mutable.Set.empty[String]
   def didChange(uri: URI): Unit = {
     compileUnitsCache.didChange(uri)
   }
@@ -753,10 +753,9 @@ class MetalsGlobal(
   /**
    * Drop a closed editor buffer from the presentation compiler.
    *
-   * Open files are keyed by a virtual file whose path is the URI string.
-   * The same source loaded from the sourcepath is keyed by its filesystem
-   * path, so removing only the virtual file leaves the dependency unit and
-   * its problems in place.
+   * Match both the local file identity used by the source-path loader and
+   * legacy or non-file URI identities, so no dependency unit or its problems
+   * remain after the editor buffer closes.
    */
   def forgetClosedSource(uri: URI): Unit = {
     val uriString = uri.toString
@@ -787,7 +786,7 @@ class MetalsGlobal(
   private def remove(filename: String): Unit = {
     if (!richCompilationCache.contains(filename)) {
       fullyCompiled.remove(filename)
-      toBeRemoved.add(new VirtualFile(filename))
+      toBeRemoved.add(MetalsSourceFile.file(filename))
     }
   }
 
@@ -814,13 +813,34 @@ class MetalsGlobal(
       new MetalsSourceFile(filename, codeWithCursor.toCharArray)
     )
 
+    // Replaced source symbols invalidate dependent nested-type signatures.
+    // An eviction affects this request only if it re-enters the evicted file.
+    val changedSource = unitOfFile.get(unit.source.file).exists { previous =>
+      !util.Arrays.equals(previous.source.content, unit.source.content)
+    }
+    val reenteredEvictedUnit = evictedCompilationUnits.remove(filename)
+    if (reenteredEvictedUnit || changedSource) {
+      newTyperRun()
+    }
+
     val source =
       if (filename.isScalaScript || filename.isSbt || filename.isMill)
         ScriptSourceFile(unit.source.file, unit.source.content)
       else unit.source
     val richUnit = new RichCompilationUnit(source)
+    // An explicitly queried document must be fully typed even when an earlier
+    // request loaded and pruned it through the source path. A pruned SemanticDB
+    // request re-registers the unit after addCompilationUnit returns.
+    if (!isOutline) {
+      PruneLateSourcesComponent.loadedFromSource.remove(source.file)
+    }
     if (!isOutline && !willBeRemovedAfterUsing) {
-      compileUnitsCache.didGetUnit(filename).foreach(remove)
+      compileUnitsCache.didGetUnit(filename).foreach { expired =>
+        if (!richCompilationCache.contains(expired)) {
+          evictedCompilationUnits.add(expired)
+        }
+        remove(expired)
+      }
     }
     toBeRemoved.remove(richUnit.source.file)
     unitOfFile.get(richUnit.source.file) match {
@@ -841,7 +861,12 @@ class MetalsGlobal(
             }
           }
         }
-
+        // A source-path unit can have symbols without an interactive unit.
+        // Re-enter generated companions when replacing its source.
+        val replacedSymbols = currentRun.symSource.collect {
+          case (sym, file) if file == source.file => sym
+        }
+        replacedSymbols.foreach(currentRun.symSource.remove)
         if (!isOutline) {
           fullyCompiled += filename
         } else {
