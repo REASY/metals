@@ -2,19 +2,28 @@ package tests.pc
 
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
-import java.nio.file.Paths
-import java.util.concurrent.Executors
+import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 
-import scala.meta.internal.jdk.CollectionConverters._
 import scala.meta.internal.metals.CompilerVirtualFileParams
 import scala.meta.internal.pc.PresentationCompilerConfigImpl
-import scala.meta.internal.pc.ScalaPresentationCompiler
 import scala.meta.internal.semanticdb.Diagnostic
 import scala.meta.internal.semanticdb.TextDocument
 import scala.meta.pc.SourcePathMode
 
-class SourcePathEvictionSuite extends munit.FunSuite {
+import tests.BasePCSuite
+
+class SourcePathEvictionSuite extends BasePCSuite {
+  protected def sourcePathMode: SourcePathMode = SourcePathMode.PRUNED
+
+  override protected def config: PresentationCompilerConfigImpl =
+    PresentationCompilerConfigImpl(sourcePathMode = sourcePathMode)
+
+  override protected def sourceFiles: Seq[Path] =
+    List("Model.scala", "Parser.scala", "A.scala", "B.scala", "C.scala",
+      "D.scala", "E.scala")
+      .map(tmp.resolve(_).toNIO)
+
   private val model =
     """package example
       |class Model {
@@ -30,113 +39,46 @@ class SourcePathEvictionSuite extends munit.FunSuite {
       |}
       |""".stripMargin
 
-  test("unrelated-seventh-request-keeps-typer-epoch") {
-    val root = Files.createTempDirectory("source-path-epoch-")
-    val sources = (0 to 6).map { number =>
-      val path = root.resolve(s"Unit$number.scala")
-      val text = s"package example; object Unit$number { val value = $number }"
-      Files.write(path, text.getBytes(UTF_8))
-      path -> text
-    }
-    val compiler = new ScalaPresentationCompiler()
-      .withConfiguration(
-        PresentationCompilerConfigImpl(sourcePathMode = SourcePathMode.PRUNED)
+  for (pressure <- List(4, 5))
+    test(
+      s"nested-type-identity-${sourcePathMode.toString.toLowerCase}-$pressure-files"
+    ) {
+      presentationCompiler.restart()
+      val root = tmp.toNIO
+      val contents = List(
+        "Model.scala" -> model,
+        "Parser.scala" -> "package example; class Parser(mode: Model.Mode) { def parse(): Model.Item = Model.Item(\"sample\") }",
+        "A.scala" -> "package example; object A { def make = Model.Item(\"a\") }",
+        "B.scala" -> "package example; object B { def make = Model.Packet(Model.Item(\"b\"), Model.Relaxed) }",
+        "C.scala" -> "package example; object C { def make = new Model().parse(Model.Relaxed) }",
+        "D.scala" -> "package example; object D { def make = Model.Item(7) }",
+        "E.scala" -> "package example; object E { def make = Model.Packet(Model.Item(\"e\"), Model.Relaxed) }"
       )
-      .newInstance(
-        "source-path-epoch",
-        List(
-          Paths.get(
-            classOf[
-              Option[_]
-            ].getProtectionDomain.getCodeSource.getLocation.toURI
-          )
-        ).asJava,
-        List.empty[String].asJava,
-        () => sources.map(_._1).asJava
-      )
-      .asInstanceOf[ScalaPresentationCompiler]
-    val global = compiler.newCompiler()
-    def add(number: Int): Unit = {
-      val (path, text) = sources(number)
-      global.addCompilationUnit(text, path.toUri.toString, None)
-    }
-    try {
-      val initialRun = global.currentRunId
-      for (number <- sources.indices) add(number)
-      assertEquals(
-        global.currentRunId,
-        initialRun,
-        "an eviction must not advance the epoch for an unrelated source"
-      )
-      add(0)
-      assert(
-        global.currentRunId > initialRun,
-        "re-entering the evicted source must advance the epoch"
-      )
-    } finally {
-      global.askShutdown()
-      compiler.shutdown()
-      sources.foreach { case (path, _) => Files.deleteIfExists(path) }
-      Files.deleteIfExists(root)
-    }
-  }
-
-  for {
-    mode <- List(SourcePathMode.PRUNED, SourcePathMode.FULL)
-    pressure <- List(4, 5)
-  } test(s"nested-type-identity-${mode.toString.toLowerCase}-$pressure-files") {
-    val root = Files.createTempDirectory("source-path-eviction-")
-    val contents = List(
-      "Model.scala" -> model,
-      "Parser.scala" -> "package example; class Parser(mode: Model.Mode) { def parse(): Model.Item = Model.Item(\"sample\") }",
-      "A.scala" -> "package example; object A { def make = Model.Item(\"a\") }",
-      "B.scala" -> "package example; object B { def make = Model.Packet(Model.Item(\"b\"), Model.Relaxed) }",
-      "C.scala" -> "package example; object C { def make = new Model().parse(Model.Relaxed) }",
-      "D.scala" -> "package example; object D { def make = Model.Item(7) }",
-      "E.scala" -> "package example; object E { def make = Model.Packet(Model.Item(\"e\"), Model.Relaxed) }"
-    )
-    val sources = contents.map { case (name, text) =>
-      val path = root.resolve(name)
-      Files.write(path, text.getBytes(UTF_8))
-      path
-    }
-    val executor = Executors.newScheduledThreadPool(2)
-    val compiler = new ScalaPresentationCompiler()
-      .withConfiguration(PresentationCompilerConfigImpl(sourcePathMode = mode))
-      .withExecutorService(executor)
-      .withScheduledExecutorService(executor)
-      .newInstance(
-        "source-path-eviction",
-        List(
-          Paths.get(
-            classOf[
-              Option[_]
-            ].getProtectionDomain.getCodeSource.getLocation.toURI
-          )
-        ).asJava,
-        List.empty[String].asJava,
-        () => sources.asJava
-      )
-    def query(name: String, text: String): TextDocument =
-      TextDocument.parseFrom(
-        compiler
-          .semanticdbTextDocument(
-            CompilerVirtualFileParams(
-              root.resolve(name).toUri,
-              text,
-              shouldReturnDiagnostics = true
+      contents.foreach { case (name, text) =>
+        Files.write(root.resolve(name), text.getBytes(UTF_8))
+      }
+      def query(name: String, text: String): TextDocument =
+        TextDocument.parseFrom(
+          presentationCompiler
+            .semanticdbTextDocument(
+              CompilerVirtualFileParams(
+                root.resolve(name).toUri,
+                text,
+                shouldReturnDiagnostics = true
+              )
             )
-          )
-          .get(30, TimeUnit.SECONDS)
-      )
-    def clean(document: TextDocument): Unit = {
-      assertEquals(
-        document.diagnostics.filter(_.severity == Diagnostic.Severity.ERROR),
-        Nil
-      )
-      assert(document.symbols.nonEmpty, "empty document is not a clean result")
-    }
-    try {
+            .get(30, TimeUnit.SECONDS)
+        )
+      def clean(document: TextDocument): Unit = {
+        assertEquals(
+          document.diagnostics.filter(_.severity == Diagnostic.Severity.ERROR),
+          Nil
+        )
+        assert(
+          document.symbols.nonEmpty,
+          "empty document is not a clean result"
+        )
+      }
       val before = query("Model.scala", model)
       clean(before)
       for ((name, text) <- contents.drop(2).take(pressure))
@@ -174,11 +116,9 @@ class SourcePathEvictionSuite extends munit.FunSuite {
         new String(Files.readAllBytes(root.resolve("Model.scala")), UTF_8),
         model
       )
-    } finally {
-      compiler.shutdown()
-      executor.shutdownNow()
-      sources.foreach(Files.deleteIfExists)
-      Files.deleteIfExists(root)
     }
-  }
+}
+
+class SourcePathEvictionFullSuite extends SourcePathEvictionSuite {
+  override protected def sourcePathMode: SourcePathMode = SourcePathMode.FULL
 }

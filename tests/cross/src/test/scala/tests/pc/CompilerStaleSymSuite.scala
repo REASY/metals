@@ -52,6 +52,26 @@ class CompilerStaleSymSuite extends BaseCompletionSuite {
 
     }
 
+    // Register another source between the old declaration and its rename.
+    // A new typer run must not lose the old declaration's cleanup information.
+    getItems(
+      """|package example
+         |object Previous {
+         |  val x = 1
+         |  x@@
+         |}""".stripMargin,
+      file1,
+      restart = true
+    )
+    getItems(
+      """|package example
+         |object B {
+         |  val x = 1
+         |  x@@
+         |}""".stripMargin,
+      file2,
+      restart = false
+    )
     loop(baseFile)
 
     val items = getItems(

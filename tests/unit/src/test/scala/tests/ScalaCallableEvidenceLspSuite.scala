@@ -46,6 +46,12 @@ class ScalaCallableEvidenceLspSuite
           SemanticdbTextDocumentsParams(uris.reverse.asJava)
         )
         .asScala
+      _ <- server.didOpen(owner)
+      reloaded <- server.fullServer
+        .scalaCallableEvidence(
+          SemanticdbTextDocumentsParams(uris.asJava)
+        )
+        .asScala
     } yield {
       sys.env.get("CODEHOP_QUOTED_CALLABLE_FIXTURE_OUT").foreach { output =>
         java.nio.file.Files.writeString(
@@ -100,8 +106,10 @@ class ScalaCallableEvidenceLspSuite
         reverseSelections,
         callerDocument.selections.asScala.map(_.symbol).toSet,
       )
+      assertEquals(reloaded, result)
       assertEquals(callerPath.readText, callerBefore)
       assertEquals(ownerPath.readText, ownerBefore)
     }
   }
+
 }

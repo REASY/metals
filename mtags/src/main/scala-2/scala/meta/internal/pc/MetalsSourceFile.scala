@@ -12,11 +12,9 @@ import scala.util.Try
 import scala.meta.pc.VirtualFileParams
 
 /**
- * An implementation of BatchSourceFile that implements equality based on virtual file path name.
- *
- * It is unclear why the default implementation special-cases virtual files. The presentation compiler
- * uses source file equality to prune the `allSources` list of managed files (that are compiled by the
- * background compilation thread).
+ * A compiler source whose local file identity matches the source-path loader.
+ * Contents always come from the supplied buffer, including unsaved edits.
+ * Non-file identifiers retain virtual-file identity.
  */
 class MetalsSourceFile(filename: String, contents: Array[Char])
     extends BatchSourceFile(MetalsSourceFile.file(filename), contents) {

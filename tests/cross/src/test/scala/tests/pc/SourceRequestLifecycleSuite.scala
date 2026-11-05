@@ -3,53 +3,120 @@ package tests.pc
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
 import java.nio.file.Path
-import java.nio.file.Paths
 
-import scala.meta.internal.jdk.CollectionConverters._
+import scala.reflect.io.PlainFile
+import scala.reflect.io.VirtualFile
+
 import scala.meta.internal.metals.CompilerVirtualFileParams
 import scala.meta.internal.mtags.MD5
 import scala.meta.internal.pc.MetalsGlobal
+import scala.meta.internal.pc.MetalsSourceFile
 import scala.meta.internal.pc.PresentationCompilerConfigImpl
 import scala.meta.internal.pc.ScalaPresentationCompiler
 import scala.meta.internal.pc.SemanticdbTextDocumentProvider
 import scala.meta.internal.semanticdb.Diagnostic
 import scala.meta.pc.SourcePathMode
 
-class SourceRequestLifecycleSuite extends munit.FunSuite {
+import tests.BasePCSuite
+
+class SourceRequestLifecycleSuite extends BasePCSuite {
+  override protected def config: PresentationCompilerConfigImpl =
+    PresentationCompilerConfigImpl(
+      emitDiagnostics = true,
+      sourcePathMode = SourcePathMode.PRUNED
+    )
+
+  override protected def sourceFiles: Seq[Path] =
+    (List("Model.scala") ++ (0 to 6).map(n => s"Unit$n.scala"))
+      .map(tmp.resolve(_).toNIO)
+      .filter(Files.exists(_))
+
+  private def withCompiler(check: MetalsGlobal => Unit): Unit = {
+    val compiler =
+      presentationCompiler.asInstanceOf[ScalaPresentationCompiler].newCompiler()
+    try check(compiler)
+    finally compiler.askShutdown()
+  }
+
   private def withSource(
       text: String
   )(check: (MetalsGlobal, Path) => Unit): Unit = {
-    val root = Files.createTempDirectory("source-request-lifecycle-")
-    val path = root.resolve("Model.scala")
+    val path = tmp.resolve("Model.scala").toNIO
     Files.write(path, text.getBytes(UTF_8))
-    val presentationCompiler = new ScalaPresentationCompiler()
-      .withConfiguration(
-        PresentationCompilerConfigImpl(
-          emitDiagnostics = true,
-          sourcePathMode = SourcePathMode.PRUNED
-        )
+    try withCompiler(compiler => check(compiler, path))
+    finally Files.deleteIfExists(path)
+  }
+
+  test("physical-file-identity-preserves-editor-content") {
+    val root = tmp.toNIO
+    val path = root.resolve("Unsaved model.scala")
+    val disk = "object Model { val value = 1 }\n"
+    val editor = "object Model { val value = 2 }\n"
+    Files.write(path, disk.getBytes(UTF_8))
+    try {
+      val source = new MetalsSourceFile(path.toUri.toString, editor.toCharArray)
+      assertEquals(
+        source.file,
+        new PlainFile(scala.reflect.io.Path(path.toFile))
       )
-      .newInstance(
-        "source-request-lifecycle",
-        List(
-          Paths.get(
-            classOf[
-              Option[_]
-            ].getProtectionDomain.getCodeSource.getLocation.toURI
-          )
-        ).asJava,
-        Nil.asJava,
-        () => List(path).asJava
-      )
-      .asInstanceOf[ScalaPresentationCompiler]
-    val compiler = presentationCompiler.newCompiler()
-    try check(compiler, path)
-    finally {
-      compiler.askShutdown()
-      presentationCompiler.shutdown()
+      assertEquals(source.content.mkString, editor)
+      assertEquals(new String(Files.readAllBytes(path), UTF_8), disk)
+    } finally {
       Files.deleteIfExists(path)
-      Files.deleteIfExists(root)
     }
+  }
+
+  for (
+    (filename, kind) <- List(
+      "untitled:Buffer.scala" -> "untitled",
+      "relative/Buffer.scala" -> "relative"
+    )
+  ) test(s"virtual-file-fallback-$kind") {
+    val text = "object Buffer { val value = 42 }\n"
+    val source = new MetalsSourceFile(filename, text.toCharArray)
+    assert(source.file.isInstanceOf[VirtualFile])
+    assertEquals(source.path, filename)
+    assertEquals(source.content.mkString, text)
+  }
+
+  test("new-sources-and-evicted-reentry-refresh-typer-epoch") {
+    val root = tmp.toNIO
+    val sources = (0 to 6).map { number =>
+      val path = root.resolve(s"Unit$number.scala")
+      val text = s"package example; object Unit$number { val value = $number }"
+      Files.write(path, text.getBytes(UTF_8))
+      path -> text
+    }
+    try
+      withCompiler { global =>
+        def add(number: Int): Unit = {
+          val (path, text) = sources(number)
+          global.addCompilationUnit(text, path.toUri.toString, None)
+        }
+        for (number <- sources.indices) {
+          val previousRun = global.currentRunId
+          add(number)
+          assertEquals(
+            global.currentRunId,
+            previousRun + 1,
+            "registering a new source must advance the epoch exactly once"
+          )
+        }
+        val beforeReentry = global.currentRunId
+        add(0)
+        assert(
+          global.currentRunId > beforeReentry,
+          "re-entering the evicted source must advance the epoch"
+        )
+        val afterReentry = global.currentRunId
+        add(0)
+        assertEquals(
+          global.currentRunId,
+          afterReentry,
+          "an unchanged retained source must preserve the epoch"
+        )
+      }
+    finally sources.foreach { case (path, _) => Files.deleteIfExists(path) }
   }
 
   test("cursor-moves-and-hover-preserve-epoch-but-edits-reset-it") {

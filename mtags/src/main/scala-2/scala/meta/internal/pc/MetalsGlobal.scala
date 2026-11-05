@@ -98,7 +98,7 @@ class MetalsGlobal(
   } with m.internal.pc.classpath.MetalsBrowsingLoaders
 
   val compileUnitsCache = new CompileUnitsCache(5)
-  private val evictedCompilationUnits = mutable.Set.empty[String]
+  private val invalidatedCompilationUnits = mutable.Set.empty[String]
 
   // Keep the unmarked document text with the cached unit: moving a completion
   // cursor changes the synthetic source but must not invalidate typer state.
@@ -192,7 +192,26 @@ class MetalsGlobal(
   }
 
   class MetalsGlobalSemanticdbOps(val global: compiler.type)
-      extends SemanticdbOps
+      extends SemanticdbOps {
+    // SemanticDB document/synthetic serialization must use the same current
+    // overload as navigation. Its default indexOf=-1 disambiguator otherwise
+    // aliases a cached binary symbol to the first source overload.
+    override implicit def XtensionGSymbolMSymbol(
+        symbol: g.Symbol
+    ): XtensionGSymbolMSymbol = new XtensionGSymbolMSymbol(symbol) {
+      override def toSemantic: String =
+        try {
+          Option(symbol).flatMap(currentOverload).fold("") { current =>
+            if (current == symbol) super.toSemantic
+            else new XtensionGSymbolMSymbol(current).toSemantic
+          }
+        } catch {
+          // Preserve SemanticDB's interactive serialization failure boundary.
+          // Navigation's owner lookup still runs outside this boundary.
+          case NonFatal(_) if isInteractiveCompiler => ""
+        }
+    }
+  }
   lazy val semanticdbOps = new MetalsGlobalSemanticdbOps(compiler)
 
   def semanticdbSymbol(symbol: Symbol): String = {
@@ -796,10 +815,9 @@ class MetalsGlobal(
   /**
    * Drop a closed editor buffer from the presentation compiler.
    *
-   * Open files are keyed by a virtual file whose path is the URI string.
-   * The same source loaded from the sourcepath is keyed by its filesystem
-   * path, so removing only the virtual file leaves the dependency unit and
-   * its problems in place.
+   * Match both the local file identity used by the source-path loader and
+   * legacy or non-file URI identities, so no dependency unit or its problems
+   * remain after the editor buffer closes.
    */
   def forgetClosedSource(uri: URI): Unit = {
     val uriString = uri.toString
@@ -825,6 +843,13 @@ class MetalsGlobal(
       }
     }
     richCompilationCache.remove(uriString)
+  }
+
+  private[pc] def invalidatePrunedCompilationUnit(filename: String): Unit = {
+    // The source text is unchanged, but this unit no longer contains executable
+    // bodies. The next full request needs a fresh unit and a fresh typer epoch.
+    fullyCompiled.remove(filename)
+    invalidatedCompilationUnits.add(filename)
   }
 
   private def remove(filename: String): Unit = {
@@ -857,8 +882,8 @@ class MetalsGlobal(
       new MetalsSourceFile(filename, codeWithCursor.toCharArray)
     )
 
-    // Replaced source symbols invalidate dependent nested-type signatures.
-    // An eviction affects this request only if it re-enters the evicted file.
+    // A newly registered source can replace classfile-loaded symbols. Edits,
+    // eviction and body pruning also invalidate dependent nested signatures.
     val changedSource = unitOfFile.get(unit.source.file).exists {
       case previous: BufferCompilationUnit => previous.documentText != code
       case previous =>
@@ -867,9 +892,13 @@ class MetalsGlobal(
           else unit.source
         !util.Arrays.equals(previous.source.content, unmarkedSource.content)
     }
-    val reenteredEvictedUnit = evictedCompilationUnits.remove(filename)
+    val reenteredInvalidatedUnit = invalidatedCompilationUnits.remove(filename)
     val previousRun = currentRun
-    if (reenteredEvictedUnit || changedSource) {
+    if (
+      !unitOfFile.contains(
+        unit.source.file
+      ) || reenteredInvalidatedUnit || changedSource
+    ) {
       newTyperRun()
     }
 
@@ -887,7 +916,7 @@ class MetalsGlobal(
     if (!isOutline && !willBeRemovedAfterUsing) {
       compileUnitsCache.didGetUnit(filename).foreach { expired =>
         if (!richCompilationCache.contains(expired)) {
-          evictedCompilationUnits.add(expired)
+          invalidatedCompilationUnits.add(expired)
         }
         remove(expired)
       }

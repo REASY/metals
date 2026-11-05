@@ -38,7 +38,7 @@ class CodehopSourcePathEvictionSuite extends munit.FunSuite {
       |}
       |""".stripMargin
 
-  test("unrelated-seventh-request-keeps-typer-epoch") {
+  test("new-sources-and-evicted-reentry-refresh-typer-epoch") {
     val root = Files.createTempDirectory("source-path-epoch-")
     val sources = (0 to 6).map { number =>
       val path = root.resolve(s"Unit$number.scala")
@@ -69,17 +69,27 @@ class CodehopSourcePathEvictionSuite extends munit.FunSuite {
       global.addCompilationUnit(text, path.toUri.toString, None)
     }
     try {
-      val initialRun = global.currentRunId
-      for (number <- sources.indices) add(number)
-      assertEquals(
-        global.currentRunId,
-        initialRun,
-        "an eviction must not advance the epoch for an unrelated source"
-      )
+      for (number <- sources.indices) {
+        val previousRun = global.currentRunId
+        add(number)
+        assertEquals(
+          global.currentRunId,
+          previousRun + 1,
+          "registering a new source must advance the epoch exactly once"
+        )
+      }
+      val beforeReentry = global.currentRunId
       add(0)
       assert(
-        global.currentRunId > initialRun,
+        global.currentRunId > beforeReentry,
         "re-entering the evicted source must advance the epoch"
+      )
+      val afterReentry = global.currentRunId
+      add(0)
+      assertEquals(
+        global.currentRunId,
+        afterReentry,
+        "an unchanged retained source must preserve the epoch"
       )
     } finally {
       global.askShutdown()
