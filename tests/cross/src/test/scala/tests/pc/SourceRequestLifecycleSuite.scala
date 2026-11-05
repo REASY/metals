@@ -188,6 +188,14 @@ class SourceRequestLifecycleSuite extends BasePCSuite {
       val epoch = currentRunId
       query(other, otherText.replace("= 1", "= 2"))
       assert(currentRunId > epoch)
+      // Keep exercising the cached-tree fallback even though Metals now carries
+      // retained source ownership across its own epoch refreshes.
+      currentRun.symSource.keys
+        .filter { symbol =>
+          currentRun.symSource(symbol) == oldClass.pos.source.file
+        }
+        .toList
+        .foreach(currentRun.symSource.remove)
       assert(!currentRun.symSource.values.exists(_ == oldClass.pos.source.file))
       val renamed = text.replace("OldName", "NewName")
       addCompilationUnit(renamed, path.toUri.toString, None)

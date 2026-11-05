@@ -900,6 +900,11 @@ class MetalsGlobal(
       ) || reenteredInvalidatedUnit || changedSource
     ) {
       newTyperRun()
+      // Retained source owners can still have lazy nested declarations. Namer's
+      // companionSymbolOf uses Run.compiles(owner) to avoid recursively forcing
+      // such an owner while it is being completed. Refresh types without losing
+      // the source ownership of declarations that remain in the compiler.
+      currentRun.symSource ++= previousRun.symSource
     }
 
     val source =
