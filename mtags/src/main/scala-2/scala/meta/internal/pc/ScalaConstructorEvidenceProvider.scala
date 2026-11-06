@@ -8,6 +8,7 @@ import scala.jdk.CollectionConverters._
 
 import scala.meta.internal.mtags.MD5
 import scala.meta.pc.ScalaConstructorEvidence
+import scala.meta.pc.ScalaConstructorEvidence.AnonymousConstructor
 import scala.meta.pc.ScalaConstructorEvidence.Invocation
 import scala.meta.pc.ScalaConstructorEvidence.Parameter
 import scala.meta.pc.ScalaConstructorEvidence.TypeReference
@@ -92,6 +93,7 @@ final class ScalaConstructorEvidenceProvider(
         unavailable("COMPILER_ERROR")
       else {
         val invocations = mutable.ListBuffer.empty[Invocation]
+        val anonymousOwners = mutable.Map.empty[Symbol, (ClassDef, Range)]
         var visited = 0
         var boundExceeded = false
         object collect extends Traverser {
@@ -102,10 +104,54 @@ final class ScalaConstructorEvidenceProvider(
               boundExceeded = true
             else {
               tree match {
+                case block @ Block(stats, Apply(select @ Select(_: New, _), _))
+                    if select.symbol != NoSymbol && select.symbol.isConstructor &&
+                      select.symbol.owner.isAnonymousClass =>
+                  // The block binds this exact compiler class and then allocates
+                  // it. Parent constructor/trait symbols are never its body.
+                  val owners = stats.collect {
+                    case cls: ClassDef if cls.symbol == select.symbol.owner =>
+                      cls
+                  }
+                  (owners, range(block.pos)) match {
+                    case (List(cls), Some(sourceRange)) =>
+                      anonymousOwners.put(cls.symbol, (cls, sourceRange))
+                    case _ => ()
+                  }
                 case apply @ Apply(select @ Select(receiver: New, _), arguments)
                     if select.symbol != NoSymbol && select.symbol.isConstructor =>
                   val selected = select.symbol
-                  val invocationRange = range(apply.pos)
+                  val anonymous = anonymousOwners.get(selected.owner).flatMap {
+                    case (cls, ownerRange) =>
+                      val constructors = cls.impl.body.collect {
+                        case definition: DefDef
+                            if definition.symbol == selected &&
+                              definition.symbol.owner == cls.symbol &&
+                              definition.rhs != EmptyTree =>
+                          definition
+                      }
+                      val parents = cls.impl.parents
+                        .map(p => semanticdbSymbol(p.tpe.typeSymbol))
+                      val parameterCount = selected.info.paramLists.flatten.size
+                      if (
+                        constructors.size != 1 || parents.isEmpty ||
+                        parents.size > 128 || parents.exists(_.isEmpty) ||
+                        parameterCount != arguments.size || parameterCount > 128
+                      ) None
+                      else
+                        Some(
+                          new AnonymousConstructor(
+                            ownerRange,
+                            semanticdbSymbol(cls.symbol),
+                            semanticdbSymbol(selected),
+                            parents.asJava,
+                            parameterCount,
+                            arguments.size
+                          )
+                        )
+                  }
+                  val invocationRange =
+                    anonymous.map(_.ownerRange).orElse(range(apply.pos))
                   val calleeRange = range(receiver.tpt.pos)
                   val budget = new TypeBudget
                   val clauses = selected.info.paramLists
@@ -122,8 +168,10 @@ final class ScalaConstructorEvidenceProvider(
                   val selectedSymbol = semanticdbSymbol(selected)
                   val ownerSymbol = semanticdbSymbol(selected.owner)
                   val reason =
-                    if (selected.owner.isAnonymousClass) "ANONYMOUS_CONSTRUCTOR"
-                    else if (
+                    if (selected.owner.isAnonymousClass) {
+                      if (anonymous.isDefined) ""
+                      else "ANONYMOUS_INITIALIZER_UNAVAILABLE"
+                    } else if (
                       invocationRange.isEmpty || calleeRange.isEmpty ||
                       apply.pos.start > receiver.tpt.pos.start ||
                       apply.pos.end < receiver.tpt.pos.end
@@ -147,15 +195,22 @@ final class ScalaConstructorEvidenceProvider(
                     else ""
                   invocations += new Invocation(
                     invocationRange.orNull,
-                    calleeRange.orNull,
+                    if (anonymous.isDefined) null else calleeRange.orNull,
                     if (reason.isEmpty) "AVAILABLE" else "UNAVAILABLE",
                     reason,
-                    if (reason.isEmpty) selectedSymbol else null,
-                    if (reason.isEmpty) ownerSymbol else null,
-                    if (reason.isEmpty) selected.owner.fullName else null,
-                    if (reason.isEmpty) projected.map(_.flatten.asJava).asJava
+                    if (reason.isEmpty && anonymous.isEmpty) selectedSymbol
+                    else null,
+                    if (reason.isEmpty && anonymous.isEmpty) ownerSymbol
+                    else null,
+                    if (reason.isEmpty && anonymous.isEmpty)
+                      selected.owner.fullName
+                    else null,
+                    if (reason.isEmpty && anonymous.isEmpty)
+                      projected.map(_.flatten.asJava).asJava
                     else Collections.emptyList(),
-                    if (reason.isEmpty) constructed.orNull else null
+                    if (reason.isEmpty && anonymous.isEmpty) constructed.orNull
+                    else null,
+                    if (reason.isEmpty) anonymous.orNull else null
                   )
                 case _ => ()
               }

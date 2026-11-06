@@ -10,7 +10,7 @@ import scala.meta.pc.ScalaConstructorEvidence
 import tests.BasePCSuite
 
 class ConstructorEvidenceSuite extends BasePCSuite {
-  override def munitIgnore: Boolean = !scalaVersion.startsWith("2.13.")
+  override def munitIgnore: Boolean = !scalaVersion.startsWith("2.")
 
   private def evidence(source: String): ScalaConstructorEvidence =
     presentationCompiler
@@ -80,7 +80,86 @@ class ConstructorEvidenceSuite extends BasePCSuite {
     assert(result.invocations.isEmpty)
   }
 
-  test("anonymous-and-generic-signatures-abstain-without-partial-targets") {
+  test("anonymous-allocation-selects-its-own-initializer") {
+    val source =
+      """package fixture
+        |trait Handler { def run(): Int }
+        |object Caller {
+        |  val value = new Handler { val initialized = 1; def run(): Int = initialized }
+        |}
+        |""".stripMargin
+    val result = evidence(source)
+    assertEquals(result.status, "AVAILABLE", clues(result.reason))
+    val rows = result.invocations.asScala.toSeq
+    assertEquals(rows.size, 1)
+    assertEquals(rows.head.status, "AVAILABLE", clues(rows.head.reason))
+    val own = rows.head.anonymousConstructor
+    assert(own != null)
+    assert(own.ownerSymbol.nonEmpty && own.constructorSymbol.nonEmpty)
+    assertEquals(own.initializerKind, "ANONYMOUS_CLASS_INITIALIZATION")
+    assertEquals(own.parameterSemantics, "TYPED_ALLOCATION_BEFORE_LAMBDA_LIFT")
+    assert(own.parentSymbols.asScala.contains("fixture/Handler#"))
+    assertEquals(rows.head.selectedSymbol, null)
+    assertEquals(rows.head.declaringOwnerFqn, null)
+    assertEquals(rows.head.constructedType, null)
+    assert(rows.head.parameterLists.isEmpty)
+    assertEquals(rows.head.invocationRange, own.ownerRange)
+    assertEquals(own.ownerRange.getStart.getLine, 3)
+    assertEquals(own.ownerRange.getStart.getCharacter, "  val value = ".length)
+    assertEquals(
+      own.ownerRange.getEnd.getCharacter,
+      source.linesIterator.toSeq(3).length
+    )
+    val warm = evidence(source).invocations.get(0).anonymousConstructor
+    presentationCompiler.restart()
+    val fresh = evidence(source).invocations.get(0).anonymousConstructor
+    for (other <- Seq(warm, fresh)) {
+      assertEquals(other.ownerRange, own.ownerRange)
+      assertEquals(other.parentSymbols, own.parentSymbols)
+      assertEquals(other.typedParameterCount, own.typedParameterCount)
+      assertEquals(other.typedArgumentCount, own.typedArgumentCount)
+    }
+  }
+
+  test("anonymous-class-compound-generic-parent-captures-and-initializers") {
+    val source =
+      """package fixture
+        |class Parent[A](val value: A) {
+        |  def this(value: A, ignored: Int) = this(value)
+        |}
+        |trait Marker
+        |class Outer(val field: Int) {
+        |  def make(captured: Int) = new Parent[Int](captured + field, 2) with Marker {
+        |    val initialized = captured + field
+        |  }
+        |}
+        |object Other { trait Marker }
+        |object Caller { val other = new Other.Marker {} }
+        |""".stripMargin
+    val result = evidence(source)
+    assertEquals(result.status, "AVAILABLE", clues(result.reason))
+    val anonymous =
+      result.invocations.asScala.filter(_.anonymousConstructor != null).toSeq
+    assertEquals(
+      anonymous.size,
+      2,
+      clues(result.invocations.asScala.map(r => (r.status, r.reason)))
+    )
+    assert(anonymous.forall(_.status == "AVAILABLE"))
+    val parents =
+      anonymous.map(_.anonymousConstructor.parentSymbols.asScala.toSet)
+    assert(
+      parents.exists(p =>
+        p.contains("fixture/Parent#") && p.contains("fixture/Marker#")
+      )
+    )
+    assert(parents.exists(_.contains("fixture/Other.Marker#")), clues(parents))
+    assertNotEquals(anonymous(0).invocationRange, anonymous(1).invocationRange)
+    // Source super-constructor arguments are not the anonymous allocation ABI.
+    assertEquals(anonymous.head.anonymousConstructor.typedArgumentCount, 0)
+  }
+
+  test("generic-named-signatures-abstain-without-partial-targets") {
     val result = evidence(
       """package fixture
         |class Box[A](value: A)
@@ -98,12 +177,13 @@ class ConstructorEvidenceSuite extends BasePCSuite {
       clues(rows.map(_.reason))
     )
     assert(
-      rows.exists(_.reason == "ANONYMOUS_CONSTRUCTOR"),
+      rows.exists(_.anonymousConstructor != null),
       clues(rows.map(_.reason))
     )
-    assert(rows.forall(_.status == "UNAVAILABLE"), clues(rows.map(_.status)))
+    val rejected = rows.filter(_.status == "UNAVAILABLE")
+    assertEquals(rejected.size, 1)
     assert(
-      rows.forall(r =>
+      rejected.forall(r =>
         r.selectedSymbol == null && r.constructedType == null && r.parameterLists.isEmpty
       )
     )

@@ -15,15 +15,17 @@ class ScalaConstructorEvidenceLspSuite
             |{"a":{"scalaVersion":"2.13.18"}}
             |/$owner
             |package fixture
-            |final class Choice(value: Int) {
+            |class Choice(value: Int) {
             |  def this(value: String) = this(value.length)
             |}
+            |trait Marker
             |/$caller
             |package fixture
             |object Caller {
             |  /* 😀 */ val number = new Choice(1)
             |  val text = new Choice("x")
             |  val alias = new RuntimeException("fixture")
+            |  val anonymous = new Choice(2) with Marker { val initialized = 3 }
             |}
             |""".stripMargin
       )
@@ -52,7 +54,7 @@ class ScalaConstructorEvidenceLspSuite
         )
       }
       assertEquals(result.status, "AVAILABLE", clues(result.reason))
-      assertEquals(result.schemaVersion, "metals-scala-constructor-evidence.v1")
+      assertEquals(result.schemaVersion, "metals-scala-constructor-evidence.v2")
       val documents = result.documents.asScala.toSeq
       assertEquals(documents.size, 2)
       assert(
@@ -66,12 +68,22 @@ class ScalaConstructorEvidenceLspSuite
         .invocations
         .asScala
         .toSeq
-      assertEquals(rows.size, 3)
+      assertEquals(rows.size, 4)
       assert(rows.forall(_.status == "AVAILABLE"), clues(rows.map(_.reason)))
       assertNotEquals(rows(0).selectedSymbol, rows(1).selectedSymbol)
       assertEquals(rows(0).declaringOwnerSymbol, "fixture/Choice#")
       assertEquals(rows(1).declaringOwnerSymbol, "fixture/Choice#")
       assertEquals(rows(2).declaringOwnerSymbol, "java/lang/RuntimeException#")
+      val anonymous = rows(3).anonymousConstructor
+      assert(anonymous != null)
+      assertEquals(anonymous.initializerKind, "ANONYMOUS_CLASS_INITIALIZATION")
+      assertEquals(anonymous.ownerRange, rows(3).invocationRange)
+      assert(anonymous.parentSymbols.asScala.contains("fixture/Choice#"))
+      assert(anonymous.parentSymbols.asScala.contains("fixture/Marker#"))
+      assertEquals(rows(3).selectedSymbol, null)
+      val json = new com.google.gson.Gson().toJsonTree(result).toString
+      assert(json.contains("anonymousConstructor"))
+      assert(json.contains("TYPED_ALLOCATION_BEFORE_LAMBDA_LIFT"))
       assertEquals(
         reversed.documents.asScala
           .find(_.uri == callerPath.toURI.toString)
