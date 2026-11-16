@@ -27,6 +27,10 @@ case class ImplementationsResult[T](
     isIncomplete: Boolean = false,
     processedCandidates: Int = 0,
     totalCandidates: Int = 0,
+    attemptedDocuments: Int = 0,
+    depthLimitReached: Boolean = false,
+    compilerQuarantined: Boolean = false,
+    omissionReasons: List[String] = Nil,
 )
 
 object ImplementationsResult {

@@ -257,6 +257,19 @@ public abstract class PresentationCompiler {
   /** Clean the symbol table and other mutable state in the compiler. */
   public abstract void restart();
 
+  /**
+   * Experimental versioned invalidation epoch for retained SemanticDB documents.
+   * Null means unsupported: callers must not reuse documents across requests.
+   */
+  public String semanticdbContextEpoch() {
+    return null;
+  }
+
+  /** Logical quarantine state; this does not attest that compiler threads stopped. */
+  public boolean semanticdbCompilerQuarantined() {
+    return false;
+  }
+
   /** Set logger level for reports. */
   public PresentationCompiler withLogger(Logger logger) {
     return this;

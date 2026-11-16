@@ -1,6 +1,5 @@
 package scala.meta.internal.metals.mbt
 
-import java.nio.file.Files
 import java.time.Duration
 import java.util.Collections
 import java.util.concurrent.CancellationException
@@ -18,11 +17,11 @@ import scala.concurrent.duration.FiniteDuration
 
 import scala.meta.infra.Event
 import scala.meta.infra.MonitoringClient
+import scala.meta.internal.async.CompletableCancelToken
 import scala.meta.internal.metals.AdjustRange
 import scala.meta.internal.metals.Buffers
 import scala.meta.internal.metals.BuildTargets
 import scala.meta.internal.metals.Compilers
-import scala.meta.internal.metals.Directories
 import scala.meta.internal.metals.EmptyCancelToken
 import scala.meta.internal.metals.ImplementationsResult
 import scala.meta.internal.metals.MetalsEnrichments._
@@ -45,6 +44,7 @@ import scala.meta.internal.semanticdb.TypeRef
 import scala.meta.internal.semanticdb.XtensionSemanticdbSymbolInformation
 import scala.meta.internal.{semanticdb => s}
 import scala.meta.io.AbsolutePath
+import scala.meta.pc.CancelToken
 
 import org.eclipse.lsp4j.ReferenceParams
 import org.eclipse.lsp4j.jsonrpc.messages.{Either => JEither}
@@ -63,11 +63,8 @@ class MbtReferenceProvider(
     workspace: AbsolutePath,
     userConfig: () => UserConfiguration,
 )(implicit ec: ExecutionContext) {
-  private val cache = new TextDocumentCache(
-    workspace.resolve(Directories.semanticdbCache),
-    () => userConfig().mbt.semanticdbCacheEnabled,
-    () => userConfig().mbt.semanticdbCacheMaxSize,
-  )
+  private val cache =
+    new TextDocumentCache(() => userConfig().mbt.semanticdbCacheMaxSize)
 
   // When looking for usages of a method, we don't visit supermethods from these
   // types because it would result in a ton of noisy results. This list should
@@ -97,7 +94,13 @@ class MbtReferenceProvider(
       paths: Iterable[AbsolutePath]
   ): Iterator[Seq[AbsolutePath]] =
     if (isMbtMode) paths.iterator.grouped(groupSize)
-    else paths.toSeq.groupBy(buildTargets.inverseSources(_)).values.iterator
+    else
+      paths.toSeq
+        .groupBy(buildTargets.inverseSources(_))
+        .toSeq
+        .sortBy(_._1.map(_.getUri).getOrElse(""))
+        .map(_._2)
+        .iterator
 
   /** Returns the length of the common path prefix between two paths. */
   private def commonPrefixLength(a: AbsolutePath, b: AbsolutePath): Int = {
@@ -123,7 +126,7 @@ class MbtReferenceProvider(
       .possibleReferences(params)
       .filterNot(_.filename.endsWith(".proto"))
       .toSeq
-      .sortBy(c => -commonPrefixLength(path, c))
+      .sortBy(c => (-commonPrefixLength(path, c), c.toString))
 
   // We timebox the search because the user could do "Find References" on
   // java.lang.String and get matches in ALL files, which is always going to
@@ -143,12 +146,24 @@ class MbtReferenceProvider(
     userConfig,
   )
 
+  private def compilerQuarantined(path: AbsolutePath): Boolean =
+    compilers
+      .semanticdbCompilerContext(path, isMbtMode)
+      .exists(_.semanticdbCompilerQuarantined())
+
   def implementations(
       params: l.TextDocumentPositionParams
+  ): Future[ImplementationsResult[l.Location]] =
+    implementations(params, EmptyCancelToken)
+
+  def implementations(
+      params: l.TextDocumentPositionParams,
+      token: CancelToken,
   ): Future[ImplementationsResult[l.Location]] = implementations(
     params.getTextDocument.getUri.toAbsolutePath,
     params.getPosition(),
     createOutput = (location, info) => location,
+    token = token,
   )
 
   def implementations[T](
@@ -156,12 +171,20 @@ class MbtReferenceProvider(
       pos: l.Position,
       createOutput: (l.Location, s.SymbolInformation) => T,
   ): Future[ImplementationsResult[T]] =
+    implementations(path, pos, createOutput, EmptyCancelToken)
+
+  def implementations[T](
+      path: AbsolutePath,
+      pos: l.Position,
+      createOutput: (l.Location, s.SymbolInformation) => T,
+      token: CancelToken,
+  ): Future[ImplementationsResult[T]] =
     workDoneProgress.trackProgressFuture(
       "Finding implementations",
       taskProgress => {
         val timer = new Timer(time)
-        Future(doImplementations(path, pos, taskProgress, createOutput)).map {
-          case (results, symbol) =>
+        Future(doImplementations(path, pos, taskProgress, createOutput, token))
+          .map { case (results, symbol) =>
             metrics.recordEvent(
               Event
                 .duration("find_implementations", timer.elapsed)
@@ -170,7 +193,7 @@ class MbtReferenceProvider(
                 .withOptional("symbol", symbol)
             )
             results
-        }
+          }
       },
     )
 
@@ -179,9 +202,25 @@ class MbtReferenceProvider(
       pos: l.Position,
       taskProgress: TaskProgress,
       createOutput: (l.Location, s.SymbolInformation) => T,
+      token: CancelToken,
   ): (ImplementationsResult[T], Option[String]) = {
     val timer = new Timer(time)
-    val requestDoc = cache.indexSingle(path)
+    token.checkCanceled()
+    val requestDoc = cache.indexSingle(path, token)
+    if (requestDoc.md5.isEmpty) {
+      return (
+        ImplementationsResult(
+          Nil,
+          isIncomplete = true,
+          totalCandidates = 1,
+          attemptedDocuments = 1,
+          compilerQuarantined = compilerQuarantined(path),
+          omissionReasons = List("REQUEST_DOCUMENT_UNAVAILABLE") ++
+            Option.when(compilerQuarantined(path))("COMPILER_QUARANTINED"),
+        ),
+        None,
+      )
+    }
     val enclosingOccurrences = this.enclosingOccurrences(requestDoc, pos)
     scribe.info(
       s"implementations: found ${enclosingOccurrences.length} occurrences"
@@ -194,7 +233,7 @@ class MbtReferenceProvider(
         enclosingOccurrences,
         taskProgress,
         timer,
-        cache.index,
+        paths => cache.indexWithToken(paths, token),
         commonPrefixLength,
         createOutput,
       )
@@ -205,6 +244,7 @@ class MbtReferenceProvider(
         taskProgress,
         timer,
         createOutput,
+        token,
       )
     }
   }
@@ -215,6 +255,7 @@ class MbtReferenceProvider(
       taskProgress: TaskProgress,
       timer: Timer,
       createOutput: (l.Location, s.SymbolInformation) => T,
+      token: CancelToken,
   ): (ImplementationsResult[T], Option[String]) = {
     val enclosingSymbols = enclosingOccurrences.map(_.symbol)
     val primarySymbol = enclosingSymbols.headOption
@@ -226,6 +267,12 @@ class MbtReferenceProvider(
     var processedCandidates = 0
     var totalCandidates = 0
     var timedOut = false
+    var depthLimitReached = false
+    var hadDocumentErrors = false
+    var hadQuarantinedCompiler = false
+    val candidatePaths = mutable.Set.empty[AbsolutePath]
+    val attemptedPaths = mutable.Set.empty[AbsolutePath]
+    val completedPaths = mutable.Set.empty[AbsolutePath]
 
     def visitDoc(doc: s.TextDocument): Boolean = {
       def overridesOrImplements(info: s.SymbolInformation): Boolean = {
@@ -271,6 +318,7 @@ class MbtReferenceProvider(
     @tailrec
     def loop(depth: Int): Unit = {
       if (depth > maxDepth) {
+        depthLimitReached = true
         scribe.warn(s"implementation: depth reached: $depth")
         return
       }
@@ -284,6 +332,7 @@ class MbtReferenceProvider(
         path,
       )
 
+      candidatePaths ++= candidates
       scribe.info(s"Found ${candidates.size} candidate files for depth $depth.")
       lastQueryRound = Set.from(isOverridenSymbol)
       var didMakeProgress = false
@@ -291,8 +340,17 @@ class MbtReferenceProvider(
       totalCandidates = candidates.size
       val remaining = groupPathsForIndexing(candidates)
       while (remaining.hasNext && !timer.hasElapsed(timeout)) {
+        token.checkCanceled()
         val paths = remaining.next()
-        for (doc <- cache.index(paths).documents) {
+        attemptedPaths ++= paths
+        val indexed = cache.indexWithToken(paths, token)
+        hadQuarantinedCompiler ||= paths.exists(compilerQuarantined)
+        for (doc <- indexed.documents) {
+          token.checkCanceled()
+          doc.uri.toAbsolutePathSafe.foreach(completedPaths.add)
+          hadDocumentErrors ||= doc.diagnostics.exists(
+            _.severity == s.Diagnostic.Severity.ERROR
+          )
           val didVisit = visitDoc(doc)
           didMakeProgress = didMakeProgress || didVisit
           processedCandidates += 1
@@ -320,13 +378,27 @@ class MbtReferenceProvider(
       s"implementations: found ${result.size} implementation results in $timer"
     )
 
-    val isIncomplete = timedOut
+    val missingDocuments = candidatePaths.exists(path => !completedPaths(path))
+    val isIncomplete =
+      timedOut || depthLimitReached || hadDocumentErrors || hadQuarantinedCompiler ||
+        enclosingOccurrences.isEmpty || missingDocuments
     (
       ImplementationsResult(
         result.toList,
         isIncomplete,
-        processedCandidates,
-        totalCandidates,
+        completedPaths.size,
+        candidatePaths.size,
+        attemptedPaths.size,
+        depthLimitReached,
+        hadQuarantinedCompiler,
+        List(
+          Option.when(timedOut)("SEARCH_TIMEOUT"),
+          Option.when(depthLimitReached)("DEPTH_LIMIT"),
+          Option.when(hadDocumentErrors)("DOCUMENT_DIAGNOSTICS"),
+          Option.when(hadQuarantinedCompiler)("COMPILER_QUARANTINED"),
+          Option.when(enclosingOccurrences.isEmpty)("SYMBOL_UNAVAILABLE"),
+          Option.when(missingDocuments)("DOCUMENT_UNAVAILABLE"),
+        ).flatten,
       ),
       primarySymbol,
     )
@@ -380,15 +452,22 @@ class MbtReferenceProvider(
     s.TextDocuments(documents = documents.toSeq.sortBy(_.uri))
   }
 
-  def compilerTextDocuments(paths: Seq[AbsolutePath]): s.TextDocuments = {
+  def compilerTextDocuments(paths: Seq[AbsolutePath]): s.TextDocuments =
+    compilerTextDocuments(paths, EmptyCancelToken)
+
+  def compilerTextDocuments(
+      paths: Seq[AbsolutePath],
+      token: CancelToken,
+  ): s.TextDocuments = {
+    token.checkCanceled()
     val documents = for {
       group <- groupPathsForIndexing(paths.distinct.sortBy(_.toString))
-      document <- batchCompileTextDocuments(
-        group,
-        useFallbackCompiler = false,
-        requireBuildTargetClasspath = true,
-      )
+      document <- {
+        token.checkCanceled()
+        cache.indexCompilerOnly(group, token).documents
+      }
     } yield document
+    token.checkCanceled()
     s.TextDocuments(documents = documents.toSeq.sortBy(_.uri))
   }
 
@@ -396,31 +475,31 @@ class MbtReferenceProvider(
       paths: Seq[AbsolutePath],
       useFallbackCompiler: Boolean,
       requireBuildTargetClasspath: Boolean = false,
-      maxRetries: Int = 3,
+      token: CancelToken = EmptyCancelToken,
   ): Seq[s.TextDocument] = {
+    token.checkCanceled()
+    val operation = new CompletableCancelToken()
+    token.onCancel.whenComplete { (cancelled, _) =>
+      if (cancelled) operation.cancel()
+    }
     try {
       Await
         .result(
           compilers.batchSemanticdbTextDocuments(
             paths,
-            EmptyCancelToken,
-            // intentionally smaller than the default PC timeout of 20s
+            operation,
+            // Cooperative batch budget; PC jobs have a separate 45s hard bound.
             Duration.ofSeconds(15),
             useFallbackCompiler = useFallbackCompiler,
             requireBuildTargetClasspath = requireBuildTargetClasspath,
           ),
-          timeout,
+          65.seconds,
         )
         .documents
     } catch {
-      case _: CancellationException if maxRetries > 0 =>
-        batchCompileTextDocuments(
-          paths,
-          useFallbackCompiler,
-          requireBuildTargetClasspath,
-          maxRetries - 1,
-        )
       case e @ (_: CancellationException | _: TimeoutException) =>
+        operation.cancel()
+        token.checkCanceled()
         scribe.warn(
           s"references: indexing ${paths.size} documents failed.",
           e,
@@ -784,75 +863,104 @@ class MbtReferenceProvider(
   // dependencies through the fallback compiler. In BSP mode, SemanticDBs are
   // tried first and per-target presentation compilers are used as a fallback.
   private class TextDocumentCache(
-      cacheDir: AbsolutePath,
-      isPersistenceEnabled: () => Boolean,
-      maxCacheSize: () => Int,
+      maxCacheSize: () => Int
   ) {
-    private val cache: java.util.Map[AbsolutePath, s.TextDocument] =
+    private final class CompilerContext(
+        val compiler: scala.meta.pc.PresentationCompiler,
+        val epoch: String,
+    ) {
+      override def hashCode(): Int =
+        31 * System.identityHashCode(compiler) + epoch.hashCode
+      override def equals(other: Any): Boolean = other match {
+        case context: CompilerContext =>
+          (compiler eq context.compiler) && epoch == context.epoch
+        case _ => false
+      }
+    }
+    private type CacheKey = (AbsolutePath, Option[CompilerContext], Boolean)
+    private def cacheKey(path: AbsolutePath, compilerOnly: Boolean): CacheKey =
+      (
+        path,
+        compilers
+          .semanticdbCompilerContext(
+            path,
+            useFallbackCompiler = !compilerOnly && isMbtMode,
+            requireBuildTargetClasspath = compilerOnly,
+          )
+          .flatMap(compiler =>
+            Option(compiler.semanticdbContextEpoch())
+              .map(epoch => new CompilerContext(compiler, epoch))
+          ),
+        compilerOnly,
+      )
+
+    private val cache: java.util.Map[CacheKey, s.TextDocument] =
       Collections.synchronizedMap(
-        new JLinkedHashMap[AbsolutePath, s.TextDocument](
+        new JLinkedHashMap[CacheKey, s.TextDocument](
           16, // initial capacity
           0.75f, // load factor
           true, // accessOrder - enables LRU ordering
         ) {
           override def removeEldestEntry(
-              eldest: java.util.Map.Entry[AbsolutePath, s.TextDocument]
+              eldest: java.util.Map.Entry[CacheKey, s.TextDocument]
           ): Boolean = size() > maxCacheSize()
         }
       )
 
-    private def diskCachePath(path: AbsolutePath): AbsolutePath = {
-      val relativePath = path.parent.toRelative(workspace)
-      val semanticdbPath = cacheDir.resolve(relativePath)
-      val name = path.filename + ".semanticdb"
-      semanticdbPath.resolve(name)
-    }
-
-    private def loadFromDisk(
-        path: AbsolutePath,
-        md5: String,
-    ): Option[s.TextDocument] = {
-      if (!isPersistenceEnabled()) None
-      else {
-        val cachePath = diskCachePath(path)
-        if (cachePath.exists) {
-          try {
-            val bytes = Files.readAllBytes(cachePath.toNIO)
-            val doc = s.TextDocument.parseFrom(bytes)
-            if (doc.md5 == md5) Some(doc)
-            else None
-          } catch {
-            case e: Exception =>
-              scribe.debug(s"Failed to load cached document for $path", e)
-              None
-          }
-        } else None
+    private def admit(
+        key: CacheKey,
+        doc: s.TextDocument,
+        token: CancelToken,
+    ): Unit = {
+      token.checkCanceled()
+      if (key._2.nonEmpty && key == cacheKey(key._1, key._3)) {
+        cache.put(key, doc)
+        if (token.isCanceled()) {
+          cache.remove(key, doc)
+          token.checkCanceled()
+        }
       }
     }
 
-    private def saveToDisk(
-        path: AbsolutePath,
-        doc: s.TextDocument,
-    ): Unit = {
-      if (isPersistenceEnabled())
-        try {
-          val cachePath = diskCachePath(path)
-          cachePath.parent.createDirectories()
-          Files.write(cachePath.toNIO, doc.toByteArray)
-        } catch {
-          case e: Exception =>
-            scribe.debug(s"Failed to save cached document for $path", e)
-        }
-    }
+    // URI+MD5 disk entries do not carry target/classpath/provider context.
+    // Only current BSP SemanticDB or context-keyed in-memory results are admitted.
 
-    def indexSingle(path: AbsolutePath): s.TextDocument = {
-      index(Seq(path)).documents.headOption.getOrElse {
+    def indexSingle(
+        path: AbsolutePath,
+        token: CancelToken = EmptyCancelToken,
+    ): s.TextDocument = {
+      indexWithToken(Seq(path), token).documents.headOption.getOrElse {
         scribe.warn(s"references: no document found for $path")
         s.TextDocument()
       }
     }
-    def index(paths: Seq[AbsolutePath]): s.TextDocuments = {
+    def index(paths: Seq[AbsolutePath]): s.TextDocuments =
+      index(paths, compilerOnly = false, EmptyCancelToken)
+
+    def indexWithToken(
+        paths: Seq[AbsolutePath],
+        token: CancelToken,
+    ): s.TextDocuments =
+      index(paths, compilerOnly = false, token)
+
+    def indexCompilerOnly(
+        paths: Seq[AbsolutePath],
+        token: CancelToken = EmptyCancelToken,
+    ): s.TextDocuments =
+      index(paths, compilerOnly = true, token)
+
+    private def index(
+        paths: Seq[AbsolutePath],
+        compilerOnly: Boolean,
+        token: CancelToken,
+    ): s.TextDocuments = {
+      token.checkCanceled()
       val docs = Buffer.empty[s.TextDocument]
+      val contexts =
+        paths.map { path =>
+          token.checkCanceled()
+          path -> cacheKey(path, compilerOnly)
+        }.toMap
       val pathsWithMd5 = paths.collect {
         case path if path.exists || buffers.contains(path) =>
           val input = path.toInputFromBuffers(buffers)
@@ -860,54 +968,73 @@ class MbtReferenceProvider(
           path -> md5
       }.toMap
 
+      def admittedDocuments(): s.TextDocuments = {
+        token.checkCanceled()
+        val current = docs.filter { doc =>
+          doc.uri.toAbsolutePathSafe.exists { path =>
+            contexts.get(path).contains(cacheKey(path, compilerOnly)) &&
+            pathsWithMd5.get(path).contains(doc.md5) &&
+            MD5.compute(path.toInputFromBuffers(buffers).text) == doc.md5
+          }
+        }
+        token.checkCanceled()
+        s.TextDocuments(documents = current.toSeq.sortBy(_.uri))
+      }
       val toIndex = pathsWithMd5.filter { case (path, md5) =>
-        Option(cache.get(path)) match {
-          case Some(doc) if doc.md5 == md5 =>
+        Option(cache.get(contexts(path))) match {
+          case Some(doc) if contexts(path)._2.nonEmpty && doc.md5 == md5 =>
             docs += doc
             false
           case _ =>
-            loadFromDisk(path, md5) match {
-              case Some(doc) =>
-                docs += doc
-                cache.put(path, doc)
-                false
-              case None =>
-                true
-            }
+            true
         }
       }
       if (toIndex.isEmpty) {
-        s.TextDocuments(documents = docs.toSeq)
+        admittedDocuments()
       } else {
         val needCompiler = Buffer.empty[AbsolutePath]
-        for ((path, md5) <- toIndex) {
-          semanticdbs().textDocument(path).toOption match {
+        for ((path, md5) <- toIndex.toSeq.sortBy(_._1.toString)) {
+          val bspDocument =
+            if (compilerOnly) None
+            else semanticdbs().textDocument(path).toOption
+          bspDocument match {
             case Some(doc) if doc.md5 == md5 =>
               // basic semanticdb uses relative uris
               val docAdjusted = doc.withUri(path.toURI.toString)
               docs += docAdjusted
-              cache.put(path, docAdjusted)
-              saveToDisk(path, docAdjusted)
+              admit(contexts(path), docAdjusted, token)
             case _ =>
               needCompiler += path
           }
         }
         if (needCompiler.isEmpty) {
-          s.TextDocuments(documents = docs.toSeq)
+          admittedDocuments()
         } else {
           val result = batchCompileTextDocuments(
             needCompiler.toSeq,
-            useFallbackCompiler = isMbtMode,
+            useFallbackCompiler = !compilerOnly && isMbtMode,
+            requireBuildTargetClasspath = compilerOnly,
+            token = token,
           )
           for {
             doc <- result
             path <- doc.uri.toAbsolutePathSafe
+            expectedMd5 <- pathsWithMd5.get(path)
+            if contexts(path) == cacheKey(path, compilerOnly)
+            if doc.md5 == expectedMd5
+            if MD5.compute(path.toInputFromBuffers(buffers).text) == expectedMd5
           } {
-            cache.put(path, doc)
-            saveToDisk(path, doc)
+            admit(contexts(path), doc, token)
           }
-          docs ++= result
-          s.TextDocuments(documents = docs.toSeq)
+          token.checkCanceled()
+          docs ++= result.filter { doc =>
+            doc.uri.toAbsolutePathSafe.exists { path =>
+              contexts(path) == cacheKey(path, compilerOnly) &&
+              pathsWithMd5.get(path).contains(doc.md5) &&
+              MD5.compute(path.toInputFromBuffers(buffers).text) == doc.md5
+            }
+          }
+          admittedDocuments()
         }
       }
     }
