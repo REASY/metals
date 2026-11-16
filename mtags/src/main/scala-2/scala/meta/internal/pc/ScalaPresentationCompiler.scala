@@ -232,11 +232,14 @@ case class ScalaPresentationCompiler(
     )
   }
 
+  private var retiredBatchEpoch = 0L
+
   private def shutdownBatchPool(): Unit = batchPoolLock.synchronized {
     if (batchCompilerPool != null) {
       logger.debug(
         s"[$buildTargetIdentifier] Shutting down batch compiler pool with ${batchCompilerPool.length} instances"
       )
+      retiredBatchEpoch += batchCompilerPool.map(_.contextEpoch).sum + 1L
       batchCompilerPool.foreach(_.shutdown())
       batchCompilerPool = null
     }
@@ -249,7 +252,20 @@ case class ScalaPresentationCompiler(
 
   def restart(): Unit = {
     compilerAccess.shutdownCurrentCompiler()
+    shutdownBatchPool()
   }
+
+  override def semanticdbContextEpoch(): String = batchPoolLock.synchronized {
+    val batchEpoch = retiredBatchEpoch +
+      Option(batchCompilerPool).fold(0L)(_.map(_.contextEpoch).sum)
+    s"codehop-semanticdb-context.v1:${compilerAccess.contextEpoch}:$batchEpoch"
+  }
+
+  override def semanticdbCompilerQuarantined(): Boolean =
+    batchPoolLock.synchronized {
+      compilerAccess.isQuarantined ||
+      Option(batchCompilerPool).exists(_.exists(_.isQuarantined))
+    }
 
   def isLoaded(): Boolean = compilerAccess.isLoaded()
 
@@ -859,9 +875,7 @@ case class ScalaPresentationCompiler(
               s"error getting text document for ${fileParam.uri()}",
               e
             )
-            docsBuffer += s.TextDocument.defaultInstance.withUri(
-              fileParam.uri().toString()
-            )
+          // Missing documents are unavailable, never valid empty evidence.
         }
       }
     }
@@ -871,78 +885,136 @@ case class ScalaPresentationCompiler(
   /**
    * Process batch sequentially using the main compilerAccess.
    */
-  private def processBatchSequential(
-      params: ju.List[VirtualFileParams],
-      timeout: Duration
-  ): CompletableFuture[Array[Byte]] = {
-    val param = params.get(0)
-
-    compilerAccess.withInterruptableCompiler(
-      Array.emptyByteArray,
-      param.token(),
-      Some(timeout)
-    ) { pc =>
-      val provider = new SemanticdbTextDocumentProvider(
-        pc.compiler(),
-        config.semanticdbCompilerOptions().asScala.toList
-      )
-      val timer = Stopwatch.createStarted()
-      val docs =
-        processFiles(params.asScala.toSeq, provider, timer, timeout, "")
-      s.TextDocuments(docs.toList).toByteArray
-    }(param.toQueryContext)
+  private val documentHardTimeout = Duration.ofSeconds(45)
+  // Negative entries are omissions, never successful empty documents. Scope
+  // them to exact source and compiler generation and bound retained state.
+  private val unavailableDocuments = new ju.LinkedHashMap[
+    (String, String, ScalaCompilerAccess, Long),
+    java.lang.Boolean
+  ](16, 0.75f, true) {
+    override def removeEldestEntry(
+        entry: ju.Map.Entry[
+          (String, String, ScalaCompilerAccess, Long),
+          java.lang.Boolean
+        ]
+    ): Boolean = size() > 512
   }
 
-  /**
-   * Process batch in parallel using multiple compiler instances.
-   * Partitions work across the main compilerAccess and the batch pool.
-   */
-  private def processBatchParallel(
-      params: ju.List[VirtualFileParams],
+  /** Retain each document before starting another cancellable compiler job. */
+  private def processBoundedChunk(
+      compiler: ScalaCompilerAccess,
+      files: Seq[VirtualFileParams],
+      timer: Stopwatch,
       timeout: Duration
-  ): CompletableFuture[Array[Byte]] = {
-    val pool = getOrCreateBatchPool()
-    val allCompilers: Array[ScalaCompilerAccess] =
-      Array(compilerAccess) ++ pool // Main + pool
-    val paramsSeq = params.asScala.toSeq
-    val chunkSize =
-      Math.ceil(paramsSeq.size.toDouble / allCompilers.length).toInt
-    val chunks = paramsSeq.grouped(chunkSize).toSeq
-
-    // Use first param for query context
-    val param = params.get(0)
-    implicit val queryContext: PcQueryContext = param.toQueryContext
-
-    // Shared timer across all chunks
-    val timer = Stopwatch.createStarted()
-
-    // Process each chunk on a different compiler
-    val futures =
-      chunks.zipWithIndex.map { case (chunk, i) =>
-        val compiler = allCompilers(i)
-        FutureConverters.toScala(
-          compiler.withInterruptableCompiler(
+  ): Future[Seq[s.TextDocument]] = {
+    def loop(
+        remaining: List[VirtualFileParams],
+        completed: Seq[s.TextDocument]
+    ): Future[Seq[s.TextDocument]] = remaining match {
+      case file :: rest
+          if !file.token().isCanceled() &&
+            timer.elapsed().compareTo(timeout) < 0 =>
+        def unavailableKey = (
+          file.uri().toString,
+          MD5.compute(file.text()),
+          compiler,
+          compiler.generation
+        )
+        val unavailable = unavailableDocuments.synchronized {
+          unavailableDocuments.containsKey(unavailableKey)
+        }
+        if (unavailable) loop(rest, completed)
+        else {
+          val submittedEpoch = compiler.contextEpoch
+          val next = compiler.withInterruptableCompiler(
             Seq.empty[s.TextDocument],
-            param.token()
+            file.token(),
+            Some(documentHardTimeout)
           ) { pc =>
             val provider = new SemanticdbTextDocumentProvider(
               pc.compiler(),
               config.semanticdbCompilerOptions().asScala.toList
             )
-            processFiles(chunk, provider, timer, timeout, s" in chunk $i")
+            processFiles(
+              Seq(file),
+              provider,
+              Stopwatch.createStarted(),
+              documentHardTimeout,
+              " per document"
+            )
+          }(file.toQueryContext)
+          FutureConverters.toScala(next).transformWith {
+            case scala.util.Success(documents) =>
+              if (
+                file
+                  .token()
+                  .isCanceled() || compiler.contextEpoch != submittedEpoch
+              )
+                Future.successful(completed)
+              else {
+                val validDocuments =
+                  documents.filter(_.md5 == MD5.compute(file.text()))
+                if (validDocuments.isEmpty) unavailableDocuments.synchronized {
+                  if (
+                    !file
+                      .token()
+                      .isCanceled() && compiler.contextEpoch == submittedEpoch
+                  )
+                    unavailableDocuments.put(
+                      unavailableKey,
+                      java.lang.Boolean.TRUE
+                    )
+                }
+                loop(rest, completed ++ validDocuments)
+              }
+            case scala.util.Failure(NonFatal(_)) =>
+              // CompilerAccess quarantines hard timeouts. Completed documents
+              // are from earlier successful jobs, never this canceled generation.
+              Future.successful(completed)
+            case scala.util.Failure(error) => Future.failed(error)
           }
-        )
-      }
+        }
+      case _ => Future.successful(completed)
+    }
+    loop(files.toList, Seq.empty)
+  }
 
+  private def processBatchSequential(
+      params: ju.List[VirtualFileParams],
+      timeout: Duration
+  ): CompletableFuture[Array[Byte]] =
     FutureConverters
       .toJava(
-        Future.sequence(futures).map { docs =>
-          val allDocs = docs.flatten
-          logger.debug(
-            s"batchSemanticdbTextDocuments: parallel processed ${allDocs.size} documents"
-          )
-          s.TextDocuments(allDocs).toByteArray
-        }
+        processBoundedChunk(
+          compilerAccess,
+          params.asScala.toSeq,
+          Stopwatch.createStarted(),
+          timeout
+        ).map(docs => s.TextDocuments(docs.toList).toByteArray)
+      )
+      .toCompletableFuture
+
+  /** Each chunk retains its own progress even when another chunk times out. */
+  private def processBatchParallel(
+      params: ju.List[VirtualFileParams],
+      timeout: Duration
+  ): CompletableFuture[Array[Byte]] = {
+    val allCompilers = Array(compilerAccess) ++ getOrCreateBatchPool()
+    val chunkSize =
+      Math.ceil(params.size().toDouble / allCompilers.length).toInt
+    val timer = Stopwatch.createStarted()
+    val futures = params.asScala.toSeq
+      .grouped(chunkSize)
+      .zipWithIndex
+      .map { case (chunk, index) =>
+        processBoundedChunk(allCompilers(index), chunk, timer, timeout)
+      }
+      .toSeq
+    FutureConverters
+      .toJava(
+        Future
+          .sequence(futures)
+          .map(docs => s.TextDocuments(docs.flatten.toList).toByteArray)
       )
       .toCompletableFuture
   }

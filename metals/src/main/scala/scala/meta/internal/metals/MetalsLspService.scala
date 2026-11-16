@@ -1435,12 +1435,157 @@ abstract class MetalsLspService(
     }
   }
 
+  def implementationWithStatus(
+      position: TextDocumentPositionParams
+  ): CompletableFuture[ImplementationWithStatusResult] =
+    CancelTokens.future { token =>
+      token.checkCanceled()
+      val result =
+        if (userConfig.referenceProvider.isMbt)
+          mbtReferenceProvider.implementations(position, token)
+        else
+          implementationProvider.implementations(position).map { locations =>
+            // The legacy provider does not expose a document census.
+            ImplementationsResult(
+              locations,
+              isIncomplete = true,
+              omissionReasons = List("DOCUMENT_CENSUS_UNAVAILABLE"),
+            )
+          }
+      result.map { status =>
+        token.checkCanceled()
+        ImplementationWithStatusResult(
+          "codehop.metals-implementation-status.v1",
+          status.results.asJava,
+          status.isIncomplete,
+          status.attemptedDocuments,
+          status.processedCandidates,
+          math.max(0, status.totalCandidates - status.processedCandidates),
+          status.depthLimitReached,
+          status.compilerQuarantined,
+          status.omissionReasons.asJava,
+        )
+      }
+    }
+
+  def compileTargetsWithStatus(
+      params: CompileTargetsWithStatusParams
+  ): CompletableFuture[CompileTargetsWithStatusResult] =
+    CancelTokens.future { token =>
+      val valid = params != null && params.targets != null &&
+        params.maxTargets > 0 && params.maxTargets <= 1024 &&
+        !params.targets.isEmpty && params.targets.size() <= 4096 &&
+        params.timeoutMillis > 0 && params.timeoutMillis <= 3600000 &&
+        params.targets.asScala.forall(t => t != null && t.getUri != null)
+      if (!valid) Future.failed(new IllegalArgumentException("INVALID_REQUEST"))
+      else {
+        val targets = params.targets.asScala.toList.distinct.sortBy(_.getUri)
+        val started = System.nanoTime()
+        val budgetNanos = params.timeoutMillis * 1000000L
+        def run(
+            pending: List[b.BuildTargetIdentifier],
+            completed: List[CompileTargetWithStatus],
+        ): Future[List[CompileTargetWithStatus]] = pending match {
+          case Nil => Future.successful(completed.reverse)
+          case target :: rest =>
+            token.checkCanceled()
+            val server = buildTargets.buildServerOf(target)
+            val remaining = budgetNanos - (System.nanoTime() - started)
+            val rejection =
+              if (completed.size >= params.maxTargets)
+                Some("TARGET_BUDGET_OMITTED")
+              else if (remaining <= 0) Some("COMPILE_TIMEOUT")
+              else if (
+                completed.exists(result =>
+                  !result.realCompilation || result.statusCode != b.StatusCode.OK.getValue
+                )
+              )
+                Some("PREVIOUS_COMPILE_NOT_OK")
+              else if (buildTargets.info(target).isEmpty)
+                Some("TARGET_UNAVAILABLE")
+              else if (server.isEmpty) Some("BUILD_SERVER_UNAVAILABLE")
+              else if (server.exists(_.isMbt)) Some("SYNTHETIC_MBT_ROUTE")
+              else None
+            def row(real: Boolean, code: Int, reason: String) =
+              CompileTargetWithStatus(
+                target.getUri,
+                server.map(_.name).getOrElse(""),
+                server.map(_.version).getOrElse(""),
+                real,
+                code,
+                reason,
+              )
+            val next = rejection match {
+              case Some(reason) => Future.successful(row(false, 0, reason))
+              case None =>
+                server match {
+                  case Some(connection) =>
+                    val request = new b.CompileParams(List(target).asJava)
+                    request.setOriginId(
+                      "CODEHOP-" + java.util.UUID.randomUUID().toString
+                    )
+                    request.setArguments(List.empty[String].asJava)
+                    val compilation = connection.compile(request, None)
+                    // RequestRegistry timeouts are adaptive minima and may ask
+                    // the client to keep waiting. This endpoint has an exact
+                    // shared hard deadline instead.
+                    val deadline = sh.schedule(
+                      new Runnable {
+                        override def run(): Unit = {
+                          compilation.cancel(false)
+                          ()
+                        }
+                      },
+                      remaining,
+                      java.util.concurrent.TimeUnit.NANOSECONDS,
+                    )
+                    compilation.whenComplete { (_, _) =>
+                      deadline.cancel(false)
+                      ()
+                    }
+                    token.onCancel.whenComplete { (cancelled, _) =>
+                      if (cancelled) compilation.cancel(false)
+                    }
+                    compilation.asScala
+                      .map { result =>
+                        val code = result.getStatusCode
+                        val reason =
+                          if (code == b.StatusCode.OK) "COMPLETE"
+                          else if (code == b.StatusCode.ERROR) "COMPILE_ERROR"
+                          else "COMPILE_CANCELLED"
+                        row(true, code.getValue, reason)
+                      }
+                      .recover { case scala.util.control.NonFatal(_) =>
+                        val reason =
+                          if (System.nanoTime() - started >= budgetNanos)
+                            "COMPILE_TIMEOUT"
+                          else "COMPILE_FAILED"
+                        row(true, 0, reason)
+                      }
+                  case None =>
+                    Future.successful(row(false, 0, "BUILD_SERVER_UNAVAILABLE"))
+                }
+            }
+            next.flatMap(status => run(rest, status :: completed))
+        }
+        run(targets, Nil).map { results =>
+          CompileTargetsWithStatusResult(
+            "codehop.metals-compile-targets.v1",
+            results.asJava,
+            results.exists(result =>
+              !result.realCompilation || result.statusCode != b.StatusCode.OK.getValue
+            ),
+          )
+        }
+      }
+    }
+
   override def implementation(
       position: TextDocumentPositionParams
   ): CompletableFuture[util.List[Location]] =
-    CancelTokens.future { _ =>
+    CancelTokens.future { token =>
       if (userConfig.referenceProvider.isMbt) {
-        mbtReferenceProvider.implementations(position).map { result =>
+        mbtReferenceProvider.implementations(position, token).map { result =>
           notifyIncompleteSearch(
             result.isIncomplete,
             result.processedCandidates,
@@ -1641,6 +1786,17 @@ abstract class MetalsLspService(
         compiledOrigins = true,
       )
     }
+
+  def semanticdbTextDocumentsWithToken(
+      params: SemanticdbTextDocumentsParams,
+      token: scala.meta.pc.CancelToken,
+  ): Future[SemanticdbTextDocumentsResult] = Future {
+    token.checkCanceled()
+    val paths = params.uris.asScala.map(_.toAbsolutePath).toSeq
+    val documents = mbtReferenceProvider.compilerTextDocuments(paths, token)
+    token.checkCanceled()
+    SemanticdbTextDocumentsResult.fromSemanticdb(documents)
+  }
 
   def semanticdbTextDocuments(
       params: SemanticdbTextDocumentsParams

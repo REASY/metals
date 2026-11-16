@@ -6,6 +6,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 import scala.concurrent.ExecutionContextExecutor
 import scala.util.control.NonFatal
@@ -33,17 +34,47 @@ abstract class CompilerAccess[Reporter, Compiler](
 )(implicit ec: ExecutionContextExecutor) {
 
   private val jobs = CompilerJobQueue(id)
+  // A canceled future does not prove that a macro or compiler thread stopped.
+  // Never queue more work or create another generation after a hard timeout.
+  private val quarantined = new AtomicBoolean(false)
+  private val compilerGeneration = new AtomicLong(0L)
+  private val compilerInvalidations = new AtomicLong(0L)
+  def contextEpoch: Long = compilerInvalidations.get()
+  def isQuarantined: Boolean = quarantined.get()
+  def generation: Long = compilerGeneration.get()
+  // All job state and compiler ownership transitions use this instance's lock.
+  private sealed trait JobState
+  private case object Queued extends JobState
+  private case object Running extends JobState
+  private case object Finished extends JobState
+  private case object TimedOut extends JobState
+  private final class CompilerJob {
+    var state: JobState = Queued
+    var thread: Thread = _
+    var compiler: CompilerWrapper[Reporter, Compiler] = _
+    var generation: Long = -1L
+  }
+  private var activeJob: CompilerJob = _
   private var _compiler: CompilerWrapper[Reporter, Compiler] = _
   private var isShutdown: Boolean = false
   private def isEmpty: Boolean = _compiler == null
-  private def isDefined: Boolean = !isEmpty
+
   private def loadCompiler(): CompilerWrapper[Reporter, Compiler] =
     synchronized {
-      if (isShutdown) {
+      val job = activeJob
+      val ownsJob = job != null && (job.thread eq Thread.currentThread())
+      if (quarantined.get())
+        throw new CompilerAccess.CompilerQuarantinedException
+      if (isShutdown || (ownsJob && job.state != Running)) {
         throw new CancellationException()
       }
       if (_compiler == null) {
         _compiler = newCompiler()
+        compilerGeneration.incrementAndGet()
+      }
+      if (ownsJob) {
+        job.compiler = _compiler
+        job.generation = compilerGeneration.get()
       }
       _compiler.resetReporter()
       _compiler
@@ -78,6 +109,8 @@ abstract class CompilerAccess[Reporter, Compiler](
   private def detachCurrentCompiler(): CompilerWrapper[Reporter, Compiler] = {
     val current = _compiler
     _compiler = null
+    compilerGeneration.incrementAndGet()
+    compilerInvalidations.incrementAndGet()
     current
   }
 
@@ -110,39 +143,12 @@ abstract class CompilerAccess[Reporter, Compiler](
   )(
       thunk: CompilerWrapper[Reporter, Compiler] => T
   )(implicit queryInfo: PcQueryContext): CompletableFuture[T] = {
-    val isFinished = new AtomicBoolean(false)
-    var queueThread = Option.empty[Thread]
-    val result = onCompilerJobQueue(
-      () => {
-        queueThread = Some(Thread.currentThread())
-        try withSharedCompiler(default)(thunk)
-        finally isFinished.set(true)
-      },
+    onCompilerJobQueue(
+      () => withSharedCompiler(default)(thunk),
       token,
-      customTimeout
+      customTimeout,
+      interruptOnCancel = true
     )
-
-    // Interrupt the queue thread
-    token.onCancel.whenCompleteAsync(
-      (isCancelled, _) => {
-        queueThread.foreach { thread =>
-          if (
-            isCancelled &&
-            isFinished.compareAndSet(false, true) &&
-            isDefined
-          ) {
-            _compiler.presentationCompilerThread match {
-              case None => // don't interrupt if we don't have separate thread
-              case Some(pcThread) =>
-                pcThread.interrupt()
-                if (thread != pcThread) thread.interrupt()
-            }
-          }
-        }
-      },
-      ec
-    )
-    result
   }
 
   /**
@@ -178,6 +184,7 @@ abstract class CompilerAccess[Reporter, Compiler](
         catch { case _: CancellationException => Left(default) }
       compiler.map(thunk).getOrElse(default)
     } catch {
+      case error: CompilerAccess.CompilerQuarantinedException => throw error
       case InterruptException() =>
         default
       case other: Throwable =>
@@ -215,6 +222,7 @@ abstract class CompilerAccess[Reporter, Compiler](
     )
     try thunk(loadCompiler())
     catch {
+      case error: CompilerAccess.CompilerQuarantinedException => throw error
       case InterruptException() =>
         default
       case NonFatal(e) =>
@@ -233,57 +241,134 @@ abstract class CompilerAccess[Reporter, Compiler](
   private def onCompilerJobQueue[T](
       thunk: () => T,
       token: CancelToken,
-      customTimeout: Option[Duration] = None
+      customTimeout: Option[Duration] = None,
+      interruptOnCancel: Boolean = false
   ): CompletableFuture[T] = {
     val result = new CompletableFuture[T]()
+    val job = new CompilerJob
+    if (quarantined.get()) {
+      result.completeExceptionally(
+        new CompilerAccess.CompilerQuarantinedException
+      )
+      return result
+    }
+    def finishJob(): Boolean = synchronized {
+      val publish = job.state == Running
+      job.state = Finished
+      if (activeJob eq job) activeJob = null
+      publish
+    }
     jobs.submit(
       result,
       { () =>
-        try {
-          if (token.isCanceled()) {
-            result.completeExceptionally(new CancellationException())
+        val shouldRun = synchronized {
+          if (
+            job.state != Queued || result.isDone() ||
+            token.isCanceled() || quarantined.get()
+          ) {
+            job.state = Finished
+            false
           } else {
-            Thread.interrupted() // clear interrupt bit
-            result.complete(thunk())
+            job.state = Running
+            job.thread = Thread.currentThread()
+            activeJob = job
+            true
           }
-        } catch {
-          case NonFatal(e) =>
-            logger.error(s"presentation compiler error ${e.getMessage()}", e)
-            result.completeExceptionally(e)
+        }
+        if (!shouldRun)
+          result.completeExceptionally(
+            if (quarantined.get())
+              new CompilerAccess.CompilerQuarantinedException
+            else new CancellationException()
+          )
+        else {
+          try {
+            Thread.interrupted() // clear interrupt bit
+            val value = thunk()
+            // Relinquish ownership atomically before publishing a completion
+            // whose callbacks could allow another compiler job to start.
+            if (finishJob()) result.complete(value)
+          } catch {
+            case NonFatal(e) =>
+              logger.error(s"presentation compiler error ${e.getMessage()}", e)
+              if (finishJob()) result.completeExceptionally(e)
+          } finally finishJob()
         }
       }
     )
 
-    // User cancelled task.
+    // Interrupt only the exact running job's captured compiler, under the
+    // lifecycle lock so completion cannot transfer ownership in between.
     token.onCancel.whenCompleteAsync(
       (isCancelled, _) => {
-        if (isCancelled && !result.isDone()) {
+        if (isCancelled) {
+          synchronized {
+            if (
+              interruptOnCancel && job.state == Running &&
+              (activeJob eq job) && job.compiler != null
+            ) {
+              job.compiler.presentationCompilerThread.foreach { pcThread =>
+                pcThread.interrupt()
+                if (job.thread ne pcThread) job.thread.interrupt()
+              }
+            }
+          }
           result.cancel(false)
         }
       },
       ec
     )
-    // Task has timed out, cancel this request and shutdown the current compiler.
+    // Bind the watchdog to this job's lifecycle and exact compiler generation.
+    // CompilerJobQueue skips canceled futures without invoking our runnable, so
+    // a never-started job must not claim ownership of the current compiler.
     sh.foreach { scheduler =>
       scheduler.schedule[Unit](
         { () =>
-          if (!result.isDone()) {
-            try {
-              if (shouldResetJobQueue) jobs.reset()
-              result.cancel(false)
-              shutdownCurrentCompiler()
-            } catch {
-              case NonFatal(_) =>
-              case other: Throwable =>
-                if (!ignoreException(other)) throw other
+          var shouldCancel = false
+          var compilerToStop: CompilerWrapper[Reporter, Compiler] = null
+          synchronized {
+            job.state match {
+              case Queued =>
+                job.state = Finished
+                shouldCancel = true
+              case Running if activeJob eq job =>
+                job.state = TimedOut
+                shouldCancel = true
+                compilerToStop = job.compiler
+                if (
+                  job.compiler != null &&
+                  (_compiler eq job.compiler) &&
+                  compilerGeneration.get() == job.generation
+                ) {
+                  if (customTimeout.nonEmpty) quarantined.set(true)
+                  compilerToStop = detachCurrentCompiler()
+                  if (shouldResetJobQueue) jobs.reset()
+                }
+              case _ =>
             }
           }
+          try {
+            if (shouldCancel) result.cancel(false)
+            // Stop only the captured wrapper, never a subsequently loaded one.
+            stopCompiler(compilerToStop)
+          } catch {
+            case NonFatal(_) =>
+            case other: Throwable =>
+              if (!ignoreException(other)) throw other
+          }
         },
-        customTimeout.map(_.getSeconds()).getOrElse(config.timeoutDelay()),
-        customTimeout.map(_ => TimeUnit.SECONDS).getOrElse(config.timeoutUnit())
+        customTimeout.map(_.toMillis()).getOrElse(config.timeoutDelay()),
+        customTimeout
+          .map(_ => TimeUnit.MILLISECONDS)
+          .getOrElse(config.timeoutUnit())
       )
     }
 
     result
   }
+}
+
+object CompilerAccess {
+  final class CompilerQuarantinedException
+      extends IllegalStateException("CODEHOP_COMPILER_QUARANTINED")
 }

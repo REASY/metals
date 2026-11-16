@@ -2504,6 +2504,21 @@ class Compilers(
     }
   }
 
+  // The PC object owns frozen target/classpath/configuration identity. Never
+  // share retained compiler documents across independently loaded contexts.
+  private[metals] def semanticdbCompilerContext(
+      path: AbsolutePath,
+      useFallbackCompiler: Boolean,
+      requireBuildTargetClasspath: Boolean = false,
+  ): Option[PresentationCompiler] =
+    if (useFallbackCompiler && path.isScalaOrJava)
+      Some(fallbackCompilerForTarget(path))
+    else
+      loadCompiler(
+        path,
+        requireBuildTargetClasspath = requireBuildTargetClasspath,
+      )
+
   /**
    * Batch the semanticdb text documents for the given sources.
    *
@@ -2522,110 +2537,113 @@ class Compilers(
       useFallbackCompiler: Boolean,
       requireBuildTargetClasspath: Boolean = false,
       shouldPruneSemanticdb: Boolean = false,
-  ): Future[s.TextDocuments] = {
-    def getCompiler(path: AbsolutePath): Option[PresentationCompiler] =
-      if (useFallbackCompiler && path.isScalaOrJava)
-        Some(fallbackCompilerForTarget(path))
-      else
-        loadCompiler(
+  ): Future[s.TextDocuments] = SemanticdbCancellation.during(cancelToken) {
+    cancelClasspath =>
+      def getCompiler(path: AbsolutePath): Option[PresentationCompiler] =
+        semanticdbCompilerContext(
           path,
-          requireBuildTargetClasspath = requireBuildTargetClasspath,
+          useFallbackCompiler,
+          requireBuildTargetClasspath,
         )
 
-    val classpathReadiness =
-      if (requireBuildTargetClasspath) {
-        Future.sequence(sources.distinct.flatMap { source =>
-          buildTargets
-            .inverseSources(source)
-            .orElse(protoGeneratedJavaTarget(source))
-            .flatMap(target =>
-              buildTargets.targetClasspath(target, Promise[Unit]())
-            )
-        })
-      } else Future.successful(Nil)
+      val classpathReadiness =
+        if (requireBuildTargetClasspath) {
+          Future.sequence(sources.distinct.flatMap { source =>
+            buildTargets
+              .inverseSources(source)
+              .orElse(protoGeneratedJavaTarget(source))
+              .flatMap(target =>
+                buildTargets.targetClasspath(target, cancelClasspath)
+              )
+          })
+        } else Future.successful(Nil)
 
-    classpathReadiness.flatMap { _ =>
-      val futures = for {
-        (pc, paths) <- sources
-          .flatMap(s => getCompiler(s).map(pc => (pc, s)))
-          .groupBy(_._1)
-      } yield {
-        val params: Seq[(VirtualFileParams, AdjustLspData, AbsolutePath)] =
-          paths.map { case (_, path) =>
+      classpathReadiness.flatMap { _ =>
+        cancelToken.checkCanceled()
+        val futures = for {
+          (pc, paths) <- sources
+            .flatMap { source =>
+              cancelToken.checkCanceled()
+              getCompiler(source).map(pc => (pc, source))
+            }
+            .groupBy(_._1)
+        } yield {
+          val params: Seq[(VirtualFileParams, AdjustLspData, AbsolutePath)] =
+            paths.map { case (_, path) =>
 
-            val (input, _, adjust) =
-              sourceMapper.pcMapping(path, pc.scalaVersion())
-            val params = CompilerVirtualFileParams(
-              path.toURI,
-              input.value,
-              token = cancelToken,
-              shouldReturnDiagnostics = true,
-              shouldPruneSemanticdb = shouldPruneSemanticdb,
-            )
-            (params: VirtualFileParams, adjust, path)
-          }
+              val (input, _, adjust) =
+                sourceMapper.pcMapping(path, pc.scalaVersion())
+              val params = CompilerVirtualFileParams(
+                path.toURI,
+                input.value,
+                token = cancelToken,
+                shouldReturnDiagnostics = true,
+                shouldPruneSemanticdb = shouldPruneSemanticdb,
+              )
+              (params: VirtualFileParams, adjust, path)
+            }
 
-        if (pc.supportsBatchSemanticdbTextDocuments()) {
-          val mapping = params.flatMap {
-            // noop for normal files
-            case (_, DefaultAdjustedData, _) =>
-              None
-            case (param, adjust, path) =>
-              Some(
-                param.uri.toString() -> (
-                  adjust,
-                  path.toInputFromBuffers(buffers).value,
+          if (pc.supportsBatchSemanticdbTextDocuments()) {
+            val mapping = params.flatMap {
+              // noop for normal files
+              case (_, DefaultAdjustedData, _) =>
+                None
+              case (param, adjust, path) =>
+                Some(
+                  param.uri.toString() -> (
+                    adjust,
+                    path.toInputFromBuffers(buffers).value,
+                  )
                 )
-              )
-          }.toMap
+            }.toMap
 
-          pc.batchSemanticdbTextDocuments(params.map(_._1).asJava, timeout)
-            .asScala
-            .map(bytes =>
-              s.TextDocuments.parseFrom(bytes).documents.map { case doc =>
-                mapping
-                  .get(doc.uri.toString())
-                  .map { case (adjust, originalText) =>
-                    adjust.adjustTextDocument(doc, originalText)
-                  }
-                  .getOrElse(doc)
-              }
-            )
-        } else {
-          val all = for {
-            (param, adjust, path) <- params
-            doc = pc.semanticdbTextDocument(param)
-          } yield doc.asScala.map { d =>
-            val textDoc = s.TextDocument.parseFrom(d)
-            adjust.adjustTextDocument(
-              textDoc,
-              path.toInputFromBuffers(buffers).value,
-            )
-          }
-          Future.sequence(all).map { parsedDocs =>
-            val targetRoot = buildTargets
-              .jvmTarget(
-                new BuildTargetIdentifier(pc.buildTargetId())
+            pc.batchSemanticdbTextDocuments(params.map(_._1).asJava, timeout)
+              .asScala
+              .map(bytes =>
+                s.TextDocuments.parseFrom(bytes).documents.map { case doc =>
+                  mapping
+                    .get(doc.uri.toString())
+                    .map { case (adjust, originalText) =>
+                      adjust.adjustTextDocument(doc, originalText)
+                    }
+                    .getOrElse(doc)
+                }
               )
-              .flatMap(_.getTargetroot)
-              .getOrElse(workspace)
+          } else {
+            val all = for {
+              (param, adjust, path) <- params
+              doc = pc.semanticdbTextDocument(param)
+            } yield doc.asScala.map { d =>
+              val textDoc = s.TextDocument.parseFrom(d)
+              adjust.adjustTextDocument(
+                textDoc,
+                path.toInputFromBuffers(buffers).value,
+              )
+            }
+            Future.sequence(all).map { parsedDocs =>
+              val targetRoot = buildTargets
+                .jvmTarget(
+                  new BuildTargetIdentifier(pc.buildTargetId())
+                )
+                .flatMap(_.getTargetroot)
+                .getOrElse(workspace)
 
-            parsedDocs
-              .map { d =>
-                if (d.uri.startsWith("file:") || d.uri.startsWith("jar:"))
-                  d
-                else
-                  d.withUri(targetRoot.resolve(d.uri).toURI.toString())
-              }
+              parsedDocs
+                .map { d =>
+                  if (d.uri.startsWith("file:") || d.uri.startsWith("jar:"))
+                    d
+                  else
+                    d.withUri(targetRoot.resolve(d.uri).toURI.toString())
+                }
+            }
           }
         }
+        Future
+          .sequence(futures)
+          .map { docss =>
+            s.TextDocuments(documents = docss.flatten.toSeq)
+          }
       }
-      Future
-        .sequence(futures)
-        .map { docss =>
-          s.TextDocuments(documents = docss.flatten.toSeq)
-        }
-    }
   }
 
   /** Experimental constructor export: owning build compiler only, no fallback. */

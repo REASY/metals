@@ -35,6 +35,20 @@ import org.eclipse.lsp4j.jsonrpc.messages.Either as JEither
 class DelegatingScalaService(
     @volatile var underlying: ScalaLspService
 ) extends ScalaLspService {
+  override def implementationWithStatus(
+      params: TextDocumentPositionParams
+  ): CompletableFuture[
+    scala.meta.internal.metals.ImplementationWithStatusResult
+  ] =
+    underlying.implementationWithStatus(params)
+
+  override def compileTargetsWithStatus(
+      params: scala.meta.internal.metals.CompileTargetsWithStatusParams
+  ): CompletableFuture[
+    scala.meta.internal.metals.CompileTargetsWithStatusResult
+  ] =
+    underlying.compileTargetsWithStatus(params)
+
   override def scalaConstructorEvidence(
       params: SemanticdbTextDocumentsParams
   ): CompletableFuture[
@@ -61,6 +75,13 @@ class DelegatingScalaService(
       params: scala.meta.internal.metals.JavaReceiverTypesParams
   ): CompletableFuture[com.google.gson.JsonObject] =
     underlying.javaReceiverTypes(params)
+
+  override def semanticdbTextDocumentsBounded(
+      params: scala.meta.internal.metals.BoundedSemanticdbTextDocumentsParams
+  ): CompletableFuture[
+    scala.meta.internal.metals.BoundedSemanticdbTextDocumentsResult
+  ] =
+    underlying.semanticdbTextDocumentsBounded(params)
 
   override def semanticdbTextDocuments(
       params: SemanticdbTextDocumentsParams

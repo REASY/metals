@@ -884,6 +884,29 @@ class WorkspaceLspService(
   ): CompletableFuture[ju.List[Location]] =
     collectSeq(_.findTextInDependencyJars(params))(_.flatten.asJava).asJava
 
+  override def implementationWithStatus(
+      params: TextDocumentPositionParams
+  ): CompletableFuture[
+    scala.meta.internal.metals.ImplementationWithStatusResult
+  ] =
+    getServiceFor(params.getTextDocument.getUri)
+      .implementationWithStatus(params)
+
+  override def compileTargetsWithStatus(
+      params: scala.meta.internal.metals.CompileTargetsWithStatusParams
+  ): CompletableFuture[
+    scala.meta.internal.metals.CompileTargetsWithStatusResult
+  ] =
+    folderServices
+      .find(service =>
+        params != null && params.targets != null &&
+          params.targets.asScala.forall(target =>
+            target != null && service.buildTargets.info(target).nonEmpty
+          )
+      )
+      .getOrElse(fallbackService)
+      .compileTargetsWithStatus(params)
+
   override def javaDependencyBodies(
       params: JavaDependencyBodiesParams
   ): CompletableFuture[com.google.gson.JsonObject] =
@@ -910,6 +933,36 @@ class WorkspaceLspService(
         JavaCompiledOrigins.unavailable("INVALID_REQUEST")
       )
     else getServiceFor(params.uri).javaCompiledOrigins(params)
+
+  override def semanticdbTextDocumentsBounded(
+      params: BoundedSemanticdbTextDocumentsParams
+  ): CompletableFuture[BoundedSemanticdbTextDocumentsResult] = {
+    BoundedSemanticdbTextDocuments.validate(params)
+    val grouped = params.uris.asScala.groupBy(uri => getServiceFor(uri))
+    CancelTokens.future { token =>
+      Future
+        .sequence(grouped.map { case (service, uris) =>
+          token.checkCanceled()
+          service.semanticdbTextDocumentsWithToken(
+            SemanticdbTextDocumentsParams(uris.asJava),
+            token,
+          )
+        })
+        .map { results =>
+          token.checkCanceled()
+          val documents =
+            results.flatMap(_.documents.asScala).toSeq.sortBy(_.uri)
+          BoundedSemanticdbTextDocuments.bounded(
+            params,
+            SemanticdbTextDocumentsResult(
+              SemanticdbTextDocumentsResult.SchemaVersion,
+              documents.asJava,
+            ),
+            token,
+          )
+        }
+    }
+  }
 
   override def semanticdbTextDocuments(
       params: SemanticdbTextDocumentsParams
@@ -1863,6 +1916,18 @@ class WorkspaceLspService(
         val gson = new Gson
         val data =
           gson.toJsonTree(MetalsExperimental())
+        data.getAsJsonObject.addProperty(
+          "codehopImplementationStatus",
+          "codehop.metals-implementation-status.v1",
+        )
+        data.getAsJsonObject.addProperty(
+          "codehopCompileTargets",
+          "codehop.metals-compile-targets.v1",
+        )
+        data.getAsJsonObject.addProperty(
+          "codehopSemanticdbBounded",
+          BoundedSemanticdbTextDocuments.Format,
+        )
         capabilities.setExperimental(data)
         val serverInfo = new lsp4j.ServerInfo("Metals", BuildInfo.metalsVersion)
         new lsp4j.InitializeResult(capabilities, serverInfo)

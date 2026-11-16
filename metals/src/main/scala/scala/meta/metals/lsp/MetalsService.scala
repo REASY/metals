@@ -31,6 +31,20 @@ case class MetalsSyncParams(
  * implemented by Metals.
  */
 trait MetalsService {
+  @JsonRequest("metals/implementationWithStatus")
+  def implementationWithStatus(
+      params: TextDocumentPositionParams
+  ): CompletableFuture[
+    scala.meta.internal.metals.ImplementationWithStatusResult
+  ]
+
+  @JsonRequest("metals/compileTargetsWithStatus")
+  def compileTargetsWithStatus(
+      params: scala.meta.internal.metals.CompileTargetsWithStatusParams
+  ): CompletableFuture[
+    scala.meta.internal.metals.CompileTargetsWithStatusResult
+  ]
+
   @JsonRequest("metals/scalaConstructorEvidence")
   def scalaConstructorEvidence(
       params: SemanticdbTextDocumentsParams
@@ -57,6 +71,13 @@ trait MetalsService {
   def javaReceiverTypes(
       params: scala.meta.internal.metals.JavaReceiverTypesParams
   ): CompletableFuture[com.google.gson.JsonObject]
+
+  @JsonRequest("metals/semanticdbTextDocumentsBounded")
+  def semanticdbTextDocumentsBounded(
+      params: scala.meta.internal.metals.BoundedSemanticdbTextDocumentsParams
+  ): CompletableFuture[
+    scala.meta.internal.metals.BoundedSemanticdbTextDocumentsResult
+  ]
 
   @JsonRequest("metals/semanticdbTextDocuments")
   def semanticdbTextDocuments(
