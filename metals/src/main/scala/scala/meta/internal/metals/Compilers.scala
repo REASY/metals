@@ -179,7 +179,6 @@ class Compilers(
     mbtBuild,
     mtags,
     mbtWorkspaceSymbolProvider,
-    isTargetClosureCompiled = id => isTargetClosureCompiled(id),
   )
   def fallbackClasspaths = compilerConfiguration.fallbackClasspaths
 
