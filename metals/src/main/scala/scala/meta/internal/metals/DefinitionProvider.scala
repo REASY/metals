@@ -122,7 +122,11 @@ final class DefinitionProvider(
                 val pathToDef = res.locations.asScala.head.getUri.toAbsolutePath
                 Some(
                   res.copy(semanticdb =
-                    semanticdbs().textDocument(pathToDef).documentIncludingStale
+                    if (pathToDef.isInReadonlyDirectory(workspace)) None
+                    else
+                      semanticdbs()
+                        .textDocument(pathToDef)
+                        .documentIncludingStale
                   )
                 )
               }
