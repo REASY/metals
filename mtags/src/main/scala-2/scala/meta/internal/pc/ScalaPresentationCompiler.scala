@@ -784,26 +784,24 @@ case class ScalaPresentationCompiler(
     ) { pc =>
       val compiler = pc.compiler(params)
       val sourceFile = MetalsSourceFile.file(params.uri().toString())
-      val previouslyLoaded = compiler.unitOfFile.contains(sourceFile)
+      val previouslyLoaded =
+        compiler.unitOfFile.contains(sourceFile) ||
+          compiler.PruneLateSourcesComponent.loadedFromSource.contains(
+            sourceFile
+          )
       def isolatedEvidence(): scala.meta.pc.ScalaConstructorEvidence = {
         val isolated = newCompiler()
         try new ScalaConstructorEvidenceProvider(isolated, params).evidence()
         finally isolated.askShutdown()
       }
-      if (
-        compiler.PruneLateSourcesComponent.loadedFromSource.contains(sourceFile)
-      )
+      val evidence =
+        new ScalaConstructorEvidenceProvider(compiler, params).evidence()
+      // Prior navigation can re-enter a source-path unit and remove its
+      // late-source marker while dependent nested types retain old symbols.
+      // Revalidate once; genuine source errors remain unavailable.
+      if (previouslyLoaded && evidence.reason == "COMPILER_ERROR")
         isolatedEvidence()
-      else {
-        val evidence =
-          new ScalaConstructorEvidenceProvider(compiler, params).evidence()
-        // Prior navigation can re-enter a source-path unit and remove its
-        // late-source marker while dependent nested types retain old symbols.
-        // Revalidate once; genuine source errors remain unavailable.
-        if (previouslyLoaded && evidence.reason == "COMPILER_ERROR")
-          isolatedEvidence()
-        else evidence
-      }
+      else evidence
     }(params.toQueryContext)
 
   /**
