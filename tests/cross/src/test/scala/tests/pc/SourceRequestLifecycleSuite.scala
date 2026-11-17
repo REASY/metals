@@ -7,13 +7,17 @@ import java.nio.file.Path
 import scala.reflect.io.PlainFile
 import scala.reflect.io.VirtualFile
 
+import scala.meta.internal.metals.CompilerOffsetParams
 import scala.meta.internal.metals.CompilerVirtualFileParams
+import scala.meta.internal.metals.PcQueryContext
 import scala.meta.internal.mtags.MD5
+import scala.meta.internal.pc.CompileUnitsCache
 import scala.meta.internal.pc.MetalsGlobal
 import scala.meta.internal.pc.MetalsSourceFile
 import scala.meta.internal.pc.PresentationCompilerConfigImpl
 import scala.meta.internal.pc.ScalaPresentationCompiler
 import scala.meta.internal.pc.SemanticdbTextDocumentProvider
+import scala.meta.internal.pc.SignatureHelpProvider
 import scala.meta.internal.semanticdb.Diagnostic
 import scala.meta.pc.SourcePathMode
 
@@ -27,7 +31,10 @@ class SourceRequestLifecycleSuite extends BasePCSuite {
     )
 
   override protected def sourceFiles: Seq[Path] =
-    (List("Model.scala") ++ (0 to 6).map(n => s"Unit$n.scala"))
+    (List(
+      "Model.scala"
+    ) ++ (0 to CompileUnitsCache.DefaultKeepLastCount.toInt + 1)
+      .map(n => s"Unit$n.scala"))
       .map(tmp.resolve(_).toNIO)
       .filter(Files.exists(_))
 
@@ -81,12 +88,14 @@ class SourceRequestLifecycleSuite extends BasePCSuite {
 
   test("new-sources-and-evicted-reentry-refresh-typer-epoch") {
     val root = tmp.toNIO
-    val sources = (0 to 6).map { number =>
-      val path = root.resolve(s"Unit$number.scala")
-      val text = s"package example; object Unit$number { val value = $number }"
-      Files.write(path, text.getBytes(UTF_8))
-      path -> text
-    }
+    val sources =
+      (0 to CompileUnitsCache.DefaultKeepLastCount.toInt + 1).map { number =>
+        val path = root.resolve(s"Unit$number.scala")
+        val text =
+          s"package example; object Unit$number { val value = $number }"
+        Files.write(path, text.getBytes(UTF_8))
+        path -> text
+      }
     try
       withCompiler { global =>
         def add(number: Int): Unit = {
@@ -239,6 +248,56 @@ class SourceRequestLifecycleSuite extends BasePCSuite {
       assert(!Files.exists(unsaved))
       assertEquals(new String(Files.readAllBytes(path), UTF_8), text)
       assertEquals(compiler.semanticdbOps.gSourceFileInputCache.size, 0)
+    }
+  }
+
+  test("signature-help-retains-fully-typed-unit-across-annotations-and-calls") {
+    val text =
+      """|package example
+         |class RouteAnnot(val name: String, val tags: Array[String]) extends scala.annotation.StaticAnnotation
+         |object Model {
+         |  @SuppressWarnings(Array("unused"))
+         |  @RouteAnnot(name = "api", tags = Array("v1", "v2"))
+         |  def call(a: Int, b: String): String = b + a.toString
+         |  val result = call(1, "ok")
+         |}
+         |""".stripMargin
+    withSource(text) { (compiler, path) =>
+      implicit val queryContext: PcQueryContext =
+        presentationCompiler
+          .asInstanceOf[ScalaPresentationCompiler]
+          .emptyQueryContext
+      val uri = path.toUri
+      val provider = new SignatureHelpProvider(compiler)
+      val suppressOffset = text.indexOf("\"unused\"") + 2
+      val annotArrayOffset = text.indexOf("\"v1\"") + 2
+      val callOffset = text.indexOf("\"ok\"") + 2
+
+      val firstHelp =
+        provider.signatureHelp(CompilerOffsetParams(uri, text, suppressOffset))
+      assert(firstHelp.getSignatures.size() > 0)
+      val sourceFile = new MetalsSourceFile(uri.toString, text.toCharArray).file
+      val unit = compiler.unitOfFile(sourceFile)
+      assert(unit.isTypeChecked)
+      assert(unit.body.tpe != null)
+      val initialBody = unit.body
+      val initialRun = compiler.currentRunId
+
+      val secondHelp =
+        provider.signatureHelp(
+          CompilerOffsetParams(uri, text, annotArrayOffset)
+        )
+      assert(secondHelp.getSignatures.size() > 0)
+      assert(compiler.unitOfFile(sourceFile) eq unit)
+      assert(unit.body eq initialBody)
+      assertEquals(compiler.currentRunId, initialRun)
+
+      val thirdHelp =
+        provider.signatureHelp(CompilerOffsetParams(uri, text, callOffset))
+      assert(thirdHelp.getSignatures.size() > 0)
+      assert(compiler.unitOfFile(sourceFile) eq unit)
+      assert(unit.body eq initialBody)
+      assertEquals(compiler.currentRunId, initialRun)
     }
   }
 }

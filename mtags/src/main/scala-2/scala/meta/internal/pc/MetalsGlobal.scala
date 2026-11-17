@@ -97,7 +97,7 @@ class MetalsGlobal(
     val platform: MetalsGlobal.this.platform.type = MetalsGlobal.this.platform
   } with m.internal.pc.classpath.MetalsBrowsingLoaders
 
-  val compileUnitsCache = new CompileUnitsCache(5)
+  val compileUnitsCache = new CompileUnitsCache()
   private val invalidatedCompilationUnits = mutable.Set.empty[String]
 
   // Keep the unmarked document text with the cached unit: moving a completion
@@ -285,6 +285,46 @@ class MetalsGlobal(
       tree.symbol.pos
     } else {
       tree.pos
+    }
+  }
+
+  def annotationChildren(mdef: MemberDef): List[Tree] = {
+    def nestedAnnotationTrees(arg: ClassfileAnnotArg): List[Tree] =
+      arg match {
+        case NestedAnnotArg(annInfo) =>
+          annInfoTrees(annInfo)
+        case ArrayAnnotArg(args) =>
+          args.toList.flatMap(nestedAnnotationTrees)
+        case _ => Nil
+      }
+    def annInfoTrees(annInfo: AnnotationInfo): List[Tree] = {
+      val orig =
+        if (annInfo.original != null && annInfo.original != EmptyTree)
+          List(annInfo.original)
+        else Nil
+      orig ++ annInfo.assocs.flatMap { case (_, arg) =>
+        nestedAnnotationTrees(arg)
+      }
+    }
+    mdef.mods.annotations match {
+      case Nil if mdef.symbol != null =>
+        // After typechecking, annotations are moved from the modifiers
+        // to the annotation on the symbol of the annotatee.
+        val sym =
+          if (mdef.symbol.isModule) mdef.symbol.moduleClass
+          else mdef.symbol
+        val trees = sym.annotations.flatMap(annInfoTrees)
+        if (trees.nonEmpty) trees
+        else {
+          val fallback = mdef.symbol.annotations.flatMap(annInfoTrees)
+          if (fallback.nonEmpty || mdef.symbol.owner == null) fallback
+          else
+            mdef.symbol
+              .getterIn(mdef.symbol.owner)
+              .annotations
+              .flatMap(annInfoTrees)
+        }
+      case anns => anns
     }
   }
 

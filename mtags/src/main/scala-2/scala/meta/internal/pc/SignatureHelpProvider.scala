@@ -17,18 +17,31 @@ class SignatureHelpProvider(val compiler: MetalsGlobal)(implicit
   def signatureHelp(
       params: OffsetParams
   ): SignatureHelp = {
+    val cursorOpt = cursor(params.offset(), params.text())
     val unit = addCompilationUnit(
       code = params.text(),
       filename = params.uri().toString(),
-      cursor = cursor(params.offset(), params.text())
+      cursor = cursorOpt
     )
 
     val pos = unit.position(params.offset())
 
+    val typedEnclosingOpt =
+      if (cursorOpt.isEmpty) {
+        typeCheck(unit)
+        val enclosingApply = new EnclosingApply(pos).find(unit.body)
+        if (enclosingApply.isEmpty) None
+        else Some(enclosingApply)
+      } else {
+        for {
+          _ <- safeTypedTreeAt(pos)
+          enclosingApply = new EnclosingApply(pos).find(unit.body)
+          typedEnclosing <- safeTypedTreeAt(enclosingApply.pos)
+        } yield typedEnclosing
+      }
+
     (for {
-      _ <- safeTypedTreeAt(pos)
-      enclosingApply = new EnclosingApply(pos).find(unit.body)
-      typedEnclosing <- safeTypedTreeAt(enclosingApply.pos)
+      typedEnclosing <- typedEnclosingOpt
       enclosingCall <- new MethodCallTraverser(unit, pos).fromTree(
         typedEnclosing
       )
@@ -48,44 +61,70 @@ class SignatureHelpProvider(val compiler: MetalsGlobal)(implicit
       traverse(tree)
       last
     }
+    def effectiveQualifier(tree: Tree): Tree = tree match {
+      case TypeApply(fun, targs) if targs.forall(!_.pos.isRange) =>
+        effectiveQualifier(fun)
+      case _ => tree
+    }
+    def isSuperConstructorCall(tree: Tree): Boolean = tree match {
+      case Select(_: Super, termNames.CONSTRUCTOR) =>
+        true
+      case TreeApply(qual, _) =>
+        isSuperConstructorCall(qual)
+      case _ => false
+    }
     def isValidQualifier(qual: Tree): Boolean = {
-      val includesPos = qual.pos.includes(pos)
-      val isRange = qual.pos.isRange
-      val isTuple = qual match {
+      val effectiveQual = effectiveQualifier(qual)
+      val includesPos = effectiveQual.pos.includes(pos)
+      val isRange = effectiveQual.pos.isRange
+      val isTuple = effectiveQual match {
         case Select(ident @ Ident(TermName("scala")), TermName(tuple))
-            if tuple.startsWith("Tuple") && ident.pos == qual.pos =>
+            if tuple.startsWith("Tuple") && ident.pos == effectiveQual.pos =>
           true
         case _ =>
           false
       }
-      val isSuperConstructorCall = qual match {
-        case Select(_: Super, termNames.CONSTRUCTOR) =>
-          true
-        case _ => false
-      }
-      ((!includesPos && isRange) || (includesPos && isSuperConstructorCall)) && !isTuple
+      val isSuperCall = isSuperConstructorCall(effectiveQual)
+      ((!includesPos && isRange) || (includesPos && isSuperCall)) && !isTuple
     }
     override def traverse(tree: Tree): Unit = {
-      // Position of annotation tree is outside of `tree.pos` so must be checked separately
-      val annotationTrees = tree match {
-        case annotatable: MemberDef => annotatable.mods.annotations
-        case _ => Nil
-      }
-
-      (tree :: annotationTrees).find(_.pos.includes(pos)) match {
-        case Some(found) =>
-          found match {
-            case Apply(qual, _) if isValidQualifier(qual) =>
-              last = found
-            case TypeApply(qual, _) if isValidQualifier(qual) =>
-              last = found
-            case AppliedTypeTree(qual, _) if isValidQualifier(qual) =>
-              last = found
-            case _ =>
+      tree match {
+        case tt: TypeTree
+            if tt.original != null && (tt.pos includes tt.original.pos) =>
+          traverse(tt.original)
+        case _ =>
+          // Position of annotation tree is outside of `tree.pos` so must be checked separately
+          val annotationTrees = tree match {
+            case annotatable: MemberDef => annotationChildren(annotatable)
+            case _ => Nil
           }
-          super.traverse(found)
 
-        case None =>
+          (tree :: annotationTrees).filter(_.pos.includes(pos)).foreach {
+            found =>
+              found match {
+                case Block(stats, expr)
+                    if found.symbol == null &&
+                      stats.forall { stat =>
+                        stat.symbol != null && stat.symbol.isArtifact
+                      } =>
+                  traverse(expr)
+                  traverseTrees(stats)
+                case Apply(qual, args)
+                    if isSuperConstructorCall(qual) && isValidQualifier(qual) =>
+                  last = found
+                  traverseTrees(args)
+                case TypeApply(qual, targs) =>
+                  if (targs.exists(_.pos.isRange) && isValidQualifier(qual)) {
+                    last = found
+                  }
+                  super.traverse(found)
+                case TreeApply(qual, _) if isValidQualifier(qual) =>
+                  last = found
+                  super.traverse(found)
+                case _ =>
+                  super.traverse(found)
+              }
+          }
       }
     }
   }
@@ -181,7 +220,7 @@ class SignatureHelpProvider(val compiler: MetalsGlobal)(implicit
             .member(compiler.nme.apply)
             .safeAlternatives
             .flatMap { alt =>
-              val tpe = qual.tpe
+              val tpe = Option(qual.tpe).getOrElse(o.info)
               if (tpe == null) None
               else Some(alt -> tpe.memberType(alt))
             }
