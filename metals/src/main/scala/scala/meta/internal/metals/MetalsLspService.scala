@@ -47,6 +47,7 @@ import scala.meta.internal.metals.debug.DebugDiscovery
 import scala.meta.internal.metals.debug.DebugProvider
 import scala.meta.internal.metals.debug.DiscoveryFailures
 import scala.meta.internal.metals.doctor.Doctor
+import scala.meta.internal.metals.buildserver.BuildServerConnection
 import scala.meta.internal.metals.doctor.HeadDoctor
 import scala.meta.internal.metals.doctor.MetalsServiceInfo
 import scala.meta.internal.metals.findfiles._
@@ -74,6 +75,7 @@ import scala.meta.internal.parsing.Trees
 import scala.meta.internal.rename.RenameProvider
 import scala.meta.internal.search.SymbolHierarchyOps
 import scala.meta.internal.semanticdb.Scala.Symbols
+import scala.meta.internal.{semanticdb => s}
 import scala.meta.internal.worksheets.WorksheetProvider
 import scala.meta.io.AbsolutePath
 import scala.meta.metals.lsp.TextDocumentService
@@ -602,6 +604,7 @@ abstract class MetalsLspService(
     metrics,
     folder,
     () => userConfig,
+    () => optFileSystemSemanticdbs(),
   )
 
   val referencesProvider: ReferenceProvider = new ReferenceProvider(
@@ -1468,6 +1471,16 @@ abstract class MetalsLspService(
       }
     }
 
+  private def markCompiledWithClosure(target: b.BuildTargetIdentifier): Unit = {
+    compilers.markTargetCompiled(target)
+    val server = buildTargets.buildServerOf(target)
+    for (dep <- buildTargets.buildTargetTransitiveDependencies(target)) {
+      if (buildTargets.buildServerOf(dep) == server) {
+        compilers.markTargetCompiled(dep)
+      }
+    }
+  }
+
   def compileTargetsWithStatus(
       params: CompileTargetsWithStatusParams
   ): CompletableFuture[CompileTargetsWithStatusResult] =
@@ -1550,8 +1563,10 @@ abstract class MetalsLspService(
                       .map { result =>
                         val code = result.getStatusCode
                         val reason =
-                          if (code == b.StatusCode.OK) "COMPLETE"
-                          else if (code == b.StatusCode.ERROR) "COMPILE_ERROR"
+                          if (code == b.StatusCode.OK) {
+                            markCompiledWithClosure(target)
+                            "COMPLETE"
+                          } else if (code == b.StatusCode.ERROR) "COMPILE_ERROR"
                           else "COMPILE_CANCELLED"
                         row(true, code.getValue, reason)
                       }
@@ -1568,7 +1583,90 @@ abstract class MetalsLspService(
             }
             next.flatMap(status => run(rest, status :: completed))
         }
-        run(targets, Nil).map { results =>
+
+        def attemptBatch(
+            batchTargets: List[b.BuildTargetIdentifier],
+            connection: BuildServerConnection,
+        ): Future[List[CompileTargetWithStatus]] = {
+          token.checkCanceled()
+          val remaining = budgetNanos - (System.nanoTime() - started)
+          if (remaining <= 0) run(targets, Nil)
+          else {
+            val request = new b.CompileParams(batchTargets.asJava)
+            request.setOriginId(
+              "CODEHOP-" + java.util.UUID.randomUUID().toString
+            )
+            request.setArguments(List.empty[String].asJava)
+            scala.util.Try(connection.compile(request, None)) match {
+              case scala.util.Success(compilation) =>
+                val deadline = sh.schedule(
+                  new Runnable {
+                    override def run(): Unit = {
+                      compilation.cancel(false)
+                      ()
+                    }
+                  },
+                  remaining,
+                  java.util.concurrent.TimeUnit.NANOSECONDS,
+                )
+                compilation.whenComplete { (_, _) =>
+                  deadline.cancel(false)
+                  ()
+                }
+                token.onCancel.whenComplete { (cancelled, _) =>
+                  if (cancelled) compilation.cancel(false)
+                }
+                compilation.asScala
+                  .flatMap { result =>
+                    if (result.getStatusCode == b.StatusCode.OK) {
+                      val batchResults = batchTargets.map { target =>
+                        markCompiledWithClosure(target)
+                        CompileTargetWithStatus(
+                          target.getUri,
+                          connection.name,
+                          connection.version,
+                          realCompilation = true,
+                          b.StatusCode.OK.getValue,
+                          "COMPLETE",
+                        )
+                      }
+                      val rest = targets.drop(batchTargets.size)
+                      run(rest, batchResults.reverse)
+                    } else {
+                      run(targets, Nil)
+                    }
+                  }
+                  .recoverWith { case scala.util.control.NonFatal(_) =>
+                    run(targets, Nil)
+                  }
+              case scala.util.Failure(_) =>
+                run(targets, Nil)
+            }
+          }
+        }
+
+        val eligible = targets.take(params.maxTargets)
+        val initialBatch = eligible.headOption.flatMap { firstTarget =>
+          val firstServer = buildTargets.buildServerOf(firstTarget)
+          if (firstServer.nonEmpty && !firstServer.exists(_.isMbt)) {
+            val batch = eligible.takeWhile { t =>
+              buildTargets.info(t).nonEmpty && buildTargets.buildServerOf(
+                t
+              ) == firstServer
+            }
+            if (batch.size > 1) Some((batch, firstServer.get))
+            else None
+          } else None
+        }
+
+        val compilationExecution = initialBatch match {
+          case Some((batchTargets, connection)) =>
+            attemptBatch(batchTargets, connection)
+          case None =>
+            run(targets, Nil)
+        }
+
+        compilationExecution.map { results =>
           CompileTargetsWithStatusResult(
             "codehop.metals-compile-targets.v1",
             results.asJava,
@@ -1816,22 +1914,50 @@ abstract class MetalsLspService(
     else {
       val paths = params.uris.asScala.map(_.toAbsolutePath).toSeq
       token.checkCanceled()
-      compilers
-        .batchSemanticdbTextDocuments(
-          paths,
-          token,
-          java.time.Duration.ofSeconds(15),
-          useFallbackCompiler = false,
-          requireBuildTargetClasspath = true,
-        )
-        .map { documents =>
-          token.checkCanceled()
-          if (
-            documents.documents.map(_.uri).sorted != params.uris.asScala.sorted
+      val allCompiled = paths.nonEmpty && paths.forall { path =>
+        buildTargets.inverseSources(path).exists(compilers.isTargetCompiled)
+      }
+      def fallback(): Future[ScalaCallableEvidenceResult] =
+        compilers
+          .batchSemanticdbTextDocuments(
+            paths,
+            token,
+            java.time.Duration.ofSeconds(15),
+            useFallbackCompiler = false,
+            requireBuildTargetClasspath = true,
           )
-            ScalaCallableEvidence.unavailable("INCOMPLETE_DOCUMENT_CENSUS")
-          else ScalaCallableEvidence.fromSemanticdb(documents)
+          .map { documents =>
+            token.checkCanceled()
+            if (
+              documents.documents
+                .map(_.uri)
+                .sorted != params.uris.asScala.sorted
+            )
+              ScalaCallableEvidence.unavailable("INCOMPLETE_DOCUMENT_CENSUS")
+            else ScalaCallableEvidence.fromSemanticdb(documents)
+          }
+
+      if (allCompiled) {
+        Future {
+          scala.util
+            .Try(mbtReferenceProvider.compilerTextDocuments(paths, token))
+            .toOption
+        }.flatMap {
+          case Some(documents)
+              if documents.documents
+                .map(_.uri)
+                .sorted == params.uris.asScala.sorted &&
+                documents.documents.forall(d =>
+                  d.md5.nonEmpty && d.language == s.Language.SCALA
+                ) =>
+            token.checkCanceled()
+            Future.successful(ScalaCallableEvidence.fromSemanticdb(documents))
+          case _ =>
+            fallback()
         }
+      } else {
+        fallback()
+      }
     }
   }
 

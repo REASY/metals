@@ -111,12 +111,15 @@ object BoundedSemanticdbTextDocuments {
     token.checkCanceled()
     validate(params)
     val requested = params.uris.asScala.toSet
-    val documents = acquired.documents.asScala.sortBy(_.uri)
+    val allDocuments = acquired.documents.asScala.sortBy(_.uri)
     if (
       acquired.schemaVersion != SemanticdbTextDocumentsResult.SchemaVersion ||
-      documents.exists(doc => !requested(doc.uri)) ||
-      documents.map(_.uri).distinct.size != documents.size
+      allDocuments.exists(doc => !requested(doc.uri)) ||
+      allDocuments.map(_.uri).distinct.size != allDocuments.size
     ) invalid()
+    val documents = allDocuments.filterNot(
+      _.generationKind == SemanticdbTextDocumentsResult.UnavailableGenerationKind
+    )
     var result = empty(params)
     for (document <- documents) {
       token.checkCanceled()
