@@ -112,4 +112,95 @@ class ScalaCallableEvidenceLspSuite
     }
   }
 
+  testLSP("compile-targets-with-status-marks-compiled-and-serves-evidence") {
+    cleanWorkspace()
+    val owner = "a/src/main/scala/fixture/Headers.scala"
+    val caller = "a/src/main/scala/fixture/Caller.scala"
+    val second = "b/src/main/scala/fixture/Second.scala"
+    for {
+      _ <- initialize(
+        s"""|/metals.json
+            |{
+            |  "a": {"scalaVersion":"2.13.18"},
+            |  "b": {"scalaVersion":"2.13.18", "dependsOn": ["a"]}
+            |}
+            |/$owner
+            |package fixture
+            |final case class Entry(values: Seq[String])
+            |/$caller
+            |package fixture
+            |object Caller {
+            |  val entry = Entry(Seq("test"))
+            |}
+            |/$second
+            |package fixture
+            |object Second {
+            |  val other = Caller.entry
+            |}
+            |""".stripMargin
+      )
+      targetA = server.server.buildTargets.all
+        .find(_.getId.getUri.contains("?id=a"))
+        .get
+        .getId
+      targetB = server.server.buildTargets.all
+        .find(_.getId.getUri.contains("?id=b"))
+        .get
+        .getId
+      _ = assertEquals(
+        server.headServer.compilers.isTargetCompiled(targetA),
+        false,
+      )
+      compileResult <- server.fullServer
+        .compileTargetsWithStatus(
+          scala.meta.internal.metals.CompileTargetsWithStatusParams(
+            List(targetA, targetB).asJava,
+            maxTargets = 10,
+            timeoutMillis = 60000L,
+          )
+        )
+        .asScala
+      _ = assertEquals(compileResult.isIncomplete, false)
+      _ = assertEquals(compileResult.targets.size(), 2)
+      _ = assert(compileResult.targets.asScala.forall(_.statusCode == 1))
+      _ = assertEquals(
+        server.headServer.compilers.isTargetCompiled(targetA),
+        true,
+      )
+      _ = assertEquals(
+        server.headServer.compilers.isTargetCompiled(targetB),
+        true,
+      )
+      _ = assertEquals(
+        server.headServer.compilers.isTargetClosureCompiled(targetA),
+        true,
+      )
+      _ = assertEquals(
+        server.headServer.compilers.isTargetClosureCompiled(targetB),
+        true,
+      )
+      callerPath = server.toPath(caller)
+      evidenceResult <- server.fullServer
+        .scalaCallableEvidence(
+          SemanticdbTextDocumentsParams(List(callerPath.toURI.toString).asJava)
+        )
+        .asScala
+      _ = assertEquals(evidenceResult.status, "AVAILABLE")
+      // Invalidation when buffer differs from disk
+      _ = server.buffers.put(
+        callerPath,
+        "package fixture\nobject Caller { val diff = 1 }",
+      )
+      _ <- server.headServer.compilers.didChange(callerPath)
+      _ = assertEquals(
+        server.headServer.compilers.isTargetCompiled(targetA),
+        false,
+      )
+      _ = assertEquals(
+        server.headServer.compilers.isTargetCompiled(targetB),
+        false,
+      )
+    } yield ()
+  }
+
 }

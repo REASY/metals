@@ -62,6 +62,7 @@ class MbtReferenceProvider(
     metrics: MonitoringClient,
     workspace: AbsolutePath,
     userConfig: () => UserConfiguration,
+    fileSystemSemanticdbs: () => Option[Semanticdbs] = () => None,
 )(implicit ec: ExecutionContext) {
   private val cache =
     new TextDocumentCache(() => userConfig().mbt.semanticdbCacheMaxSize)
@@ -968,13 +969,21 @@ class MbtReferenceProvider(
           path -> md5
       }.toMap
 
+      def isUnavailablePlaceholder(doc: s.TextDocument): Boolean =
+        doc == s.TextDocument.defaultInstance.withUri(doc.uri)
+
+      def isDocValidForPath(doc: s.TextDocument, path: AbsolutePath): Boolean =
+        isUnavailablePlaceholder(doc) || (
+          pathsWithMd5.get(path).contains(doc.md5) &&
+            MD5.compute(path.toInputFromBuffers(buffers).text) == doc.md5
+        )
+
       def admittedDocuments(): s.TextDocuments = {
         token.checkCanceled()
         val current = docs.filter { doc =>
           doc.uri.toAbsolutePathSafe.exists { path =>
             contexts.get(path).contains(cacheKey(path, compilerOnly)) &&
-            pathsWithMd5.get(path).contains(doc.md5) &&
-            MD5.compute(path.toInputFromBuffers(buffers).text) == doc.md5
+            isDocValidForPath(doc, path)
           }
         }
         token.checkCanceled()
@@ -995,12 +1004,30 @@ class MbtReferenceProvider(
         val needCompiler = Buffer.empty[AbsolutePath]
         for ((path, md5) <- toIndex.toSeq.sortBy(_._1.toString)) {
           val bspDocument =
-            if (compilerOnly) None
-            else semanticdbs().textDocument(path).toOption
+            if (compilerOnly) {
+              if (
+                contexts(path)._2.nonEmpty &&
+                buildTargets
+                  .inverseSources(path)
+                  .exists(compilers.isTargetCompiled) &&
+                path.isScalaFilename
+              ) {
+                fileSystemSemanticdbs()
+                  .flatMap(_.textDocument(path).toOption)
+                  .filter(doc =>
+                    doc.md5.equalsIgnoreCase(md5) &&
+                      (!doc.occurrences.isEmpty || doc.language == s.Language.SCALA)
+                  )
+              } else {
+                None
+              }
+            } else {
+              semanticdbs().textDocument(path).toOption
+            }
           bspDocument match {
-            case Some(doc) if doc.md5 == md5 =>
+            case Some(doc) if doc.md5.equalsIgnoreCase(md5) =>
               // basic semanticdb uses relative uris
-              val docAdjusted = doc.withUri(path.toURI.toString)
+              val docAdjusted = doc.withUri(path.toURI.toString).withMd5(md5)
               docs += docAdjusted
               admit(contexts(path), docAdjusted, token)
             case _ =>
@@ -1027,11 +1054,22 @@ class MbtReferenceProvider(
             admit(contexts(path), doc, token)
           }
           token.checkCanceled()
+          val resultPaths = result.flatMap(_.uri.toAbsolutePathSafe).toSet
+          val unavailableDocs =
+            if (compilerOnly) {
+              needCompiler
+                .filter(path =>
+                  contexts(path)._2.nonEmpty && !resultPaths.contains(path)
+                )
+                .map { path =>
+                  s.TextDocument.defaultInstance.withUri(path.toURI.toString)
+                }
+            } else Nil
+          docs ++= unavailableDocs
           docs ++= result.filter { doc =>
             doc.uri.toAbsolutePathSafe.exists { path =>
               contexts(path) == cacheKey(path, compilerOnly) &&
-              pathsWithMd5.get(path).contains(doc.md5) &&
-              MD5.compute(path.toInputFromBuffers(buffers).text) == doc.md5
+              isDocValidForPath(doc, path)
             }
           }
           admittedDocuments()

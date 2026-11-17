@@ -128,6 +128,36 @@ class Compilers(
 )(implicit ec: ExecutionContextExecutorService, rc: ReportContext)
     extends Cancelable {
 
+  private val compiledTargets = TrieMap.empty[BuildTargetIdentifier, Boolean]
+
+  def markTargetCompiled(id: BuildTargetIdentifier): Unit =
+    compiledTargets.put(id, true)
+
+  def invalidateCompiledTarget(id: BuildTargetIdentifier): Unit = {
+    for (dep <- buildTargets.allInverseDependencies(id)) {
+      compiledTargets.remove(dep)
+    }
+    compiledTargets.remove(id)
+  }
+
+  def isTargetCompiled(id: BuildTargetIdentifier): Boolean =
+    compiledTargets.contains(id)
+
+  def isTargetClosureCompiled(id: BuildTargetIdentifier): Boolean = {
+    isTargetCompiled(id) &&
+    buildTargets
+      .scalaTarget(id)
+      .toSeq
+      .flatMap(_.info.getDependencies.asScala)
+      .forall(isTargetCompiled) &&
+    buildTargets
+      .buildTargetTransitiveDependencies(id)
+      .forall(isTargetCompiled) &&
+    buildTargets
+      .scalaTarget(id)
+      .exists(t => java.nio.file.Files.isDirectory(t.targetroot.toNIO))
+  }
+
   val compilerConfiguration = new CompilerConfiguration(
     workspace,
     config,
@@ -149,6 +179,7 @@ class Compilers(
     mbtBuild,
     mtags,
     mbtWorkspaceSymbolProvider,
+    isTargetClosureCompiled = id => isTargetClosureCompiled(id),
   )
   def fallbackClasspaths = compilerConfiguration.fallbackClasspaths
 
@@ -571,11 +602,22 @@ class Compilers(
     }
   }
 
+  private def checkBufferDifferenceAndInvalidate(path: AbsolutePath): Unit = {
+    val differs =
+      buffers.get(path).exists(buf => !path.readTextOpt.contains(buf))
+    if (differs) {
+      for (targetId <- buildTargets.inverseSources(path)) {
+        invalidateCompiledTarget(targetId)
+      }
+    }
+  }
+
   private def didChangePc(
       path: AbsolutePath,
       shouldReturnDiagnostics: Boolean = false,
       token: CancelToken = EmptyCancelToken,
   ): Future[List[Diagnostic]] = {
+    checkBufferDifferenceAndInvalidate(path)
     loadCompiler(path)
       .map { pc =>
         val (input, _, adjust) =
@@ -606,6 +648,7 @@ class Compilers(
   }
 
   def didChange(path: AbsolutePath): Future[Unit] = {
+    checkBufferDifferenceAndInvalidate(path)
     if (userConfig().presentationCompilerDiagnostics)
       // Batch/debounce these requests since they can arrive in bursts
       fileDidChange(Seq(path))
@@ -620,6 +663,9 @@ class Compilers(
   }
 
   def didCompile(report: CompileReport): Unit = {
+    if (report.getErrors > 0) {
+      invalidateCompiledTarget(report.getTarget)
+    }
     val isSuccessful = report.getErrors == 0
     val isBestEffortCompilation =
       buildTargets
