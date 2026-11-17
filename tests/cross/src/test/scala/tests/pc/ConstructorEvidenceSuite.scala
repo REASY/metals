@@ -146,4 +146,67 @@ class ConstructorEvidenceSuite extends BasePCSuite {
     assertEquals(result.reason, "SOURCE_BOUND")
     assert(result.invocations.isEmpty)
   }
+
+  test("source-path-loaded-unit-promotes-in-warm-compiler") {
+    val source =
+      """package fixture
+        |final class Choice(value: Int)
+        |object Caller {
+        |  def build(): Choice = new Choice(1)
+        |}
+        |""".stripMargin
+    val path = tmp.resolve("Promoted.scala").toNIO
+    java.nio.file.Files.write(
+      path,
+      source.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+    )
+    try {
+      val spc =
+        presentationCompiler
+          .asInstanceOf[scala.meta.internal.pc.ScalaPresentationCompiler]
+      val uri = path.toUri
+      val params = CompilerVirtualFileParams(uri, source)
+      spc.compilerAccess
+        .withNonInterruptableCompiler(
+          (),
+          scala.meta.internal.metals.EmptyCancelToken
+        ) { pc =>
+          val compiler = pc.compiler()
+          val sf = new scala.meta.internal.pc.MetalsSourceFile(
+            uri.toString,
+            source.toCharArray
+          ).file
+          compiler.PruneLateSourcesComponent.loadedFromSource.add(sf)
+        }(spc.emptyQueryContext)
+        .get(30, TimeUnit.SECONDS)
+
+      val result = presentationCompiler
+        .scalaConstructorEvidence(params)
+        .get(30, TimeUnit.SECONDS)
+      assertEquals(result.status, "AVAILABLE", clues(result.reason))
+      assertEquals(result.invocations.size(), 1)
+      assertEquals(
+        result.invocations.get(0).declaringOwnerSymbol,
+        "fixture/Choice#"
+      )
+
+      val promoted = spc.compilerAccess
+        .withNonInterruptableCompiler(
+          false,
+          scala.meta.internal.metals.EmptyCancelToken
+        ) { pc =>
+          val compiler = pc.compiler()
+          val sf = new scala.meta.internal.pc.MetalsSourceFile(
+            uri.toString,
+            source.toCharArray
+          ).file
+          !compiler.PruneLateSourcesComponent.loadedFromSource.contains(sf) &&
+          compiler.unitOfFile.get(sf).exists(_.isTypeChecked)
+        }(spc.emptyQueryContext)
+        .get(30, TimeUnit.SECONDS)
+      assert(promoted, "warm compiler must retain the promoted unpruned unit")
+    } finally {
+      java.nio.file.Files.deleteIfExists(path)
+    }
+  }
 }

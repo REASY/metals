@@ -11,6 +11,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import scala.meta.internal.jdk.CollectionConverters._
 import scala.meta.internal.metals.CompilerVirtualFileParams
 import scala.meta.internal.metals.EmptyCancelToken
+import scala.meta.internal.pc.CompileUnitsCache
 import scala.meta.internal.pc.PresentationCompilerConfigImpl
 import scala.meta.internal.pc.ScalaPresentationCompiler
 import scala.meta.internal.semanticdb.Diagnostic
@@ -40,12 +41,14 @@ class CodehopSourcePathEvictionSuite extends munit.FunSuite {
 
   test("new-sources-and-evicted-reentry-refresh-typer-epoch") {
     val root = Files.createTempDirectory("source-path-epoch-")
-    val sources = (0 to 6).map { number =>
-      val path = root.resolve(s"Unit$number.scala")
-      val text = s"package example; object Unit$number { val value = $number }"
-      Files.write(path, text.getBytes(UTF_8))
-      path -> text
-    }
+    val sources =
+      (0 to CompileUnitsCache.DefaultKeepLastCount.toInt + 1).map { number =>
+        val path = root.resolve(s"Unit$number.scala")
+        val text =
+          s"package example; object Unit$number { val value = $number }"
+        Files.write(path, text.getBytes(UTF_8))
+        path -> text
+      }
     val compiler = new ScalaPresentationCompiler()
       .withConfiguration(
         PresentationCompilerConfigImpl(sourcePathMode = SourcePathMode.PRUNED)
