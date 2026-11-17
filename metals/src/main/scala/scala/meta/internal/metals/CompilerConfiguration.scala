@@ -63,7 +63,6 @@ class CompilerConfiguration(
     mbtBuild: () => MbtBuild,
     mtags: () => Mtags,
     mbtWorkspaceSymbolProvider: MbtWorkspaceSymbolProvider,
-    isTargetClosureCompiled: BuildTargetIdentifier => Boolean = _ => false,
 )(implicit ec: ExecutionContextExecutorService, rc: ReportContext) {
 
   private val plugins = new CompilerPlugins()
@@ -268,16 +267,11 @@ class CompilerConfiguration(
           .targetClasspath(buildTargetId, cancelCompilerPromise)
           .getOrElse(Future.successful(Nil))
       } yield {
-        def sourceFiles() =
-          if (isTargetClosureCompiled(buildTargetId)) {
-            ju.Collections.emptyList[Path]()
-          } else {
-            buildTargets
-              .buildTargetTransitiveSources(buildTargetId)
-              .map(_.toNIO)
-              .toSeq
-              .asJava
-          }
+        def sourceFiles() = buildTargets
+          .buildTargetTransitiveSources(buildTargetId)
+          .map(_.toNIO)
+          .toSeq
+          .asJava
         // set wasResolved to avoid races on timeout below
         val classpathSeq = classpath.toAbsoluteClasspath.map(_.toNIO).toSeq
         val result = newCompiler(classpathSeq, sourceFiles _)
@@ -421,10 +415,7 @@ class CompilerConfiguration(
         search,
         referenceCounter,
         srcFiles,
-        overrideSourcePathMode =
-          if (isTargetClosureCompiled(buildTargetId))
-            Some(SourcePathMode.DISABLED)
-          else None,
+        overrideSourcePathMode = None,
       )
         .withBuildTargetName(scalaTarget.displayName)
     }

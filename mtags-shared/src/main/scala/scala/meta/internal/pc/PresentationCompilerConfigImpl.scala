@@ -32,7 +32,7 @@ case class PresentationCompilerConfigImpl(
     override val isDetailIncludedInLabel: Boolean = true,
     isCompletionItemResolve: Boolean = true,
     _isStripMarginOnTypeFormattingEnabled: () => Boolean = () => true,
-    timeoutDelay: Long = 20,
+    timeoutDelay: Long = 60,
     timeoutUnit: TimeUnit =
       if (sys.props.contains("metals.debug")) TimeUnit.MINUTES
       else TimeUnit.SECONDS,
