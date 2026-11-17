@@ -770,14 +770,7 @@ trait Completions { this: MetalsGlobal =>
               case v: ValDef if v.pos.isOffset && v.symbol.isSynthetic =>
                 super.traverse(v)
               case mdef: MemberDef =>
-                val annTrees = mdef.mods.annotations match {
-                  case Nil if mdef.symbol != null =>
-                    // After typechecking, annotations are moved from the modifiers
-                    // to the annotation on the symbol of the annotatee.
-                    mdef.symbol.annotations.map(_.original)
-                  case anns => anns
-                }
-                traverseTrees(annTrees)
+                traverseTrees(annotationChildren(mdef))
               case _ =>
             }
           }

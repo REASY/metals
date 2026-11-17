@@ -1265,4 +1265,15 @@ class SignatureHelpSuite extends BaseSignatureHelpSuite {
        |""".stripMargin
   )
 
+  check(
+    "superclass-5",
+    """
+      |class Foo(val someField: Int, val someOtherField: Int)(someOtherField2: Int)
+      |object Bar extends Foo(1, 3)(12@@34)
+      |""".stripMargin,
+    """|<init>(someField: Int, someOtherField: Int)(someOtherField2: Int): Foo
+       |                                            ^^^^^^^^^^^^^^^^^^^^
+       |""".stripMargin
+  )
+
 }

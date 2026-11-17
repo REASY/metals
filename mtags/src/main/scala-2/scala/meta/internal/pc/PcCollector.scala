@@ -324,15 +324,8 @@ trait PcCollector[T] { self: WithCompilationUnit =>
     traverseWithParent(None)(Set.empty[T], unit.lastBody)
   }
 
-  private def annotationChildren(mdef: MemberDef): List[Tree] = {
-    mdef.mods.annotations match {
-      case Nil if mdef.symbol != null =>
-        // After typechecking, annotations are moved from the modifiers
-        // to the annotation on the symbol of the annotatee.
-        mdef.symbol.annotations.map(_.original)
-      case anns => anns
-    }
-  }
+  private def annotationChildren(mdef: MemberDef): List[Tree] =
+    compiler.annotationChildren(mdef)
 
   private def typePos(tpe: TypeTree) = {
     tpe.original match {

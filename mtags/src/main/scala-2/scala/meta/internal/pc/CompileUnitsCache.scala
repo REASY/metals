@@ -4,7 +4,9 @@ import java.net.URI
 
 import scala.collection.mutable
 
-class CompileUnitsCache(keepLastCount: Short) {
+class CompileUnitsCache(
+    val keepLastCount: Short = CompileUnitsCache.DefaultKeepLastCount
+) {
   private val lastCompiled = new LastNElementsSet[String](keepLastCount)
   private val lastModified = mutable.Set[String]()
 
@@ -21,6 +23,10 @@ class CompileUnitsCache(keepLastCount: Short) {
   def canBeRemoved(file: String): Boolean =
     !lastCompiled.contains(file) && !lastModified(file)
 
+}
+
+object CompileUnitsCache {
+  val DefaultKeepLastCount: Short = 64
 }
 
 /**
