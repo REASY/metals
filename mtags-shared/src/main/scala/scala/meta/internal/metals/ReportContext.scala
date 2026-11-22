@@ -5,9 +5,10 @@ import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Optional
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicReference
 import java.util.function.Supplier
 import java.util.logging.Logger
 
@@ -104,7 +105,7 @@ class StdReporter(
   private val logger = Logger.getLogger(classOf[ReportContext].getName)
   val maybeReportsDir: Path =
     workspace.resolve(pathToReports).resolve(name)
-  private lazy val reportsDir = maybeReportsDir.createDirectories()
+  private val retention = ReportFileRetention.forDirectory(maybeReportsDir)
   private val limitedFilesManager =
     new LimitedFilesManager(
       maybeReportsDir,
@@ -115,26 +116,7 @@ class StdReporter(
 
   private lazy val userHome = Option(System.getProperty("user.home"))
 
-  private val initialized = new AtomicBoolean(false)
-  private val reported = new AtomicReference(Map[String, Path]())
-
-  def readInIds(): Unit = {
-    val reports = getReports().flatMap { report =>
-      try {
-        val lines = Files.readAllLines(report.file.toPath())
-        if (lines.size() > 0) {
-          lines.get(0) match {
-            case id if id.startsWith(Report.idPrefix) =>
-              Some((id.stripPrefix(Report.idPrefix) -> report.toPath))
-            case _ => None
-          }
-        } else None
-      } catch {
-        case NonFatal(_) => None
-      }
-    }.toMap
-    reported.updateAndGet(_ ++ reports)
-  }
+  def readInIds(): Unit = retention.initialize(limitedFilesManager)
 
   override def create(
       lazyReport: Supplier[jreports.Report],
@@ -143,37 +125,29 @@ class StdReporter(
     if (ifVerbose && !level.isVerbose) Optional.empty()
     else
       Try {
-        if (initialized.compareAndSet(false, true)) {
-          readInIds()
-        }
+        readInIds()
         val report = lazyReport.get()
         val sanitizedId = report.id().asScala.map(sanitize)
-        val path = reportPath(report)
-
-        val optDuplicate =
-          for {
-            id <- sanitizedId
-            reportedMap = reported.getAndUpdate(map =>
-              if (map.contains(id)) map else map + (id -> path)
-            )
-            duplicate <- reportedMap.get(id)
-          } yield duplicate
-
-        val pathToReport = optDuplicate.getOrElse {
-          path.createDirectories()
-          path.writeText(
+        val (pathToReport, created) =
+          retention.create(sanitizedId, reportPath(report, _))(
             sanitize(report.fullText( /* withIdAndSummary = */ true))
           )
+        if (created) {
           logger.info(s"Created report: ${report.path()}")
           reportTrackers.foreach(_.reportCreated(report))
-          path
         }
         if (!ifVerbose)
           logger.info(
             s"${report.shortSummary()} (full report at: ${pathToReport})"
           )
         pathToReport
-      }.toOption.asJava
+      }.recoverWith { case NonFatal(error) =>
+        logger.warning(
+          s"Unable to retain report: ${error.getClass.getSimpleName}"
+        )
+        scala.util.Failure(error)
+      }.toOption
+        .asJava
 
   override def sanitize(text: String): String = {
     val textAfterWokspaceReplace =
@@ -183,27 +157,38 @@ class StdReporter(
       .getOrElse(textAfterWokspaceReplace)
   }
 
-  private def reportPath(report: jreports.Report): Path = {
-    val date = TimeFormatter.getDate()
-    val time = TimeFormatter.getTime()
+  private def reportPath(report: jreports.Report, timestamp: Long): Path = {
+    val instant = Instant.ofEpochMilli(timestamp).atZone(ZoneId.systemDefault())
+    val date = DateTimeFormatter.ofPattern("yyyy-MM-dd").format(instant)
+    val time = DateTimeFormatter.ofPattern("HH-mm-ss-SSS").format(instant)
     val buildTargetPart =
       resolveBuildTarget(report.path().asScala)
         .map(FileNameEncoderDecoder.encode)
         .map("_(" ++ _ ++ ")")
         .getOrElse("")
     val filename = s"r_${report.name()}${buildTargetPart}_${time}.md"
-    reportsDir.resolve(date).resolve(filename)
+    require(
+      !filename.contains('/') && !filename.contains('\\'),
+      "report name must be one filename"
+    )
+    maybeReportsDir.toAbsolutePath.normalize().resolve(date).resolve(filename)
   }
 
   override def cleanUpOldReports(
       maxReportsNumber: Int = StdReportContext.MAX_NUMBER_OF_REPORTS
-  ): List[TimestampedFile] = limitedFilesManager.deleteOld(maxReportsNumber)
+  ): List[TimestampedFile] = {
+    readInIds()
+    retention.cleanup(maxReportsNumber)
+  }
 
-  override def getReports(): List[TimestampedFile] =
-    limitedFilesManager.getAllFiles()
+  override def getReports(): List[TimestampedFile] = {
+    readInIds()
+    retention.reports
+  }
 
   override def deleteAll(): Unit = {
-    getReports().foreach(r => Files.delete(r.toPath))
+    readInIds()
+    retention.deleteAll()
     limitedFilesManager.directoriesWithDate.foreach { d =>
       try Files.delete(d.toPath)
       catch {
@@ -217,6 +202,8 @@ class StdReporter(
 
 object StdReportContext {
   val MAX_NUMBER_OF_REPORTS = 30
+  // Per reporter: at most 7.5 MiB of report payloads, plus bounded metadata.
+  val MAX_REPORT_BYTES: Int = 256 * 1024
   val WORKSPACE_STR = "<WORKSPACE>"
   val HOME_STR = "<HOME>"
   val ZIP_FILE_NAME = "reports.zip"

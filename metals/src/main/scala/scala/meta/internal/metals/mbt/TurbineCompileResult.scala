@@ -20,6 +20,7 @@ import com.google.turbine.lower.Lower
 case class TurbineCompileResult(
     classpath: ClassPath,
     lowered: Lower.Lowered,
+    sourceFallbacks: Seq[VirtualTextDocument] = Nil,
 ) {
 
   /**
@@ -40,6 +41,9 @@ case class TurbineCompileResult(
 
   def boundClass(binaryName: String): Option[BytecodeBoundClass] =
     Option(boundEnv.get(new ClassSymbol(binaryName)))
+
+  val sourceFallbacksByPackage: Map[String, Seq[VirtualTextDocument]] =
+    sourceFallbacks.groupBy(_.pkg.stripSuffix("/").replace('/', '.'))
 
   val symbolsByPackage: collection.Map[String, ArrayList[ClassSymbol]] = {
     val x = new HashMap[String, ArrayList[ClassSymbol]]()

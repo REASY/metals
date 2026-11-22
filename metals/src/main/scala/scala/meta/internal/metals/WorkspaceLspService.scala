@@ -884,6 +884,130 @@ class WorkspaceLspService(
   ): CompletableFuture[ju.List[Location]] =
     collectSeq(_.findTextInDependencyJars(params))(_.flatten.asJava).asJava
 
+  override def javaDependencyBodies(
+      params: JavaDependencyBodiesParams
+  ): CompletableFuture[com.google.gson.JsonObject] =
+    if (!JavaDependencyBodies.valid(params))
+      CompletableFuture.completedFuture(
+        JavaDependencyBodies.unavailable("INVALID_REQUEST")
+      )
+    else getServiceFor(params.uri).javaDependencyBodies(params)
+
+  override def javaReceiverTypes(
+      params: JavaReceiverTypesParams
+  ): CompletableFuture[com.google.gson.JsonObject] =
+    if (!JavaReceiverTypes.valid(params))
+      CompletableFuture.completedFuture(
+        JavaReceiverTypes.unavailable("INVALID_REQUEST")
+      )
+    else getServiceFor(params.uri).javaReceiverTypes(params)
+
+  override def javaCompiledOrigins(
+      params: JavaReceiverTypesParams
+  ): CompletableFuture[com.google.gson.JsonObject] =
+    if (!JavaReceiverTypes.valid(params))
+      CompletableFuture.completedFuture(
+        JavaCompiledOrigins.unavailable("INVALID_REQUEST")
+      )
+    else getServiceFor(params.uri).javaCompiledOrigins(params)
+
+  override def semanticdbTextDocuments(
+      params: SemanticdbTextDocumentsParams
+  ): CompletableFuture[SemanticdbTextDocumentsResult] = {
+    val groupedUris = params.uris.asScala.groupBy(uri => getServiceFor(uri))
+    val result = Future
+      .sequence(groupedUris.map { case (service, uris) =>
+        service.semanticdbTextDocuments(
+          SemanticdbTextDocumentsParams(uris.asJava)
+        )
+      })
+      .map { results =>
+        val documents = results.flatMap(_.documents.asScala).toSeq.sortBy(_.uri)
+        SemanticdbTextDocumentsResult(
+          SemanticdbTextDocumentsResult.SchemaVersion,
+          documents.asJava,
+        )
+      }
+    result.asJava
+  }
+
+  override def scalaCallableEvidence(
+      params: SemanticdbTextDocumentsParams
+  ): CompletableFuture[ScalaCallableEvidenceResult] = {
+    if (!ScalaCallableEvidence.valid(params))
+      CompletableFuture.completedFuture(
+        ScalaCallableEvidence.unavailable("INVALID_REQUEST")
+      )
+    else {
+      val grouped = params.uris.asScala.groupBy(uri => getServiceFor(uri))
+      CancelTokens.future { token =>
+        Future
+          .sequence(grouped.map { case (service, uris) =>
+            service.scalaCallableEvidence(
+              SemanticdbTextDocumentsParams(uris.asJava),
+              token,
+            )
+          })
+          .map { results =>
+            token.checkCanceled()
+            if (results.exists(_.status != "AVAILABLE"))
+              ScalaCallableEvidence.unavailable("SERVICE_UNAVAILABLE")
+            else
+              ScalaCallableEvidence.bounded(
+                ScalaCallableEvidenceResult(
+                  ScalaCallableEvidence.SchemaVersion,
+                  "AVAILABLE",
+                  "",
+                  results
+                    .flatMap(_.documents.asScala)
+                    .toSeq
+                    .sortBy(_.uri)
+                    .asJava,
+                )
+              )
+          }
+      }
+    }
+  }
+
+  override def scalaConstructorEvidence(
+      params: SemanticdbTextDocumentsParams
+  ): CompletableFuture[ScalaConstructorEvidenceResult] =
+    if (!ScalaConstructorEvidenceResult.valid(params))
+      CompletableFuture.completedFuture(
+        ScalaConstructorEvidenceResult.unavailable("INVALID_REQUEST")
+      )
+    else {
+      val grouped = params.uris.asScala.groupBy(uri => getServiceFor(uri))
+      CancelTokens.future { token =>
+        Future
+          .sequence(grouped.map { case (service, uris) =>
+            service.scalaConstructorEvidence(
+              SemanticdbTextDocumentsParams(uris.asJava),
+              token,
+            )
+          })
+          .map { results =>
+            token.checkCanceled()
+            if (results.exists(_.status != "AVAILABLE"))
+              ScalaConstructorEvidenceResult.unavailable("SERVICE_UNAVAILABLE")
+            else
+              ScalaConstructorEvidenceResult.bounded(
+                ScalaConstructorEvidenceResult(
+                  scala.meta.pc.ScalaConstructorEvidence.SCHEMA_VERSION,
+                  "AVAILABLE",
+                  "",
+                  results
+                    .flatMap(_.documents.asScala)
+                    .toSeq
+                    .sortBy(_.uri)
+                    .asJava,
+                )
+              )
+          }
+      }
+    }
+
   override def didCancelWorkDoneProgress(
       params: lsp4j.WorkDoneProgressCancelParams
   ): Unit = workDoneProgress.canceled(params.getToken())

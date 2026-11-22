@@ -372,6 +372,64 @@ class MbtReferenceProvider(
       }
   }
 
+  def textDocuments(paths: Seq[AbsolutePath]): s.TextDocuments = {
+    val documents = for {
+      group <- groupPathsForIndexing(paths.distinct.sortBy(_.toString))
+      document <- cache.index(group).documents
+    } yield document
+    s.TextDocuments(documents = documents.toSeq.sortBy(_.uri))
+  }
+
+  def compilerTextDocuments(paths: Seq[AbsolutePath]): s.TextDocuments = {
+    val documents = for {
+      group <- groupPathsForIndexing(paths.distinct.sortBy(_.toString))
+      document <- batchCompileTextDocuments(
+        group,
+        useFallbackCompiler = false,
+        requireBuildTargetClasspath = true,
+      )
+    } yield document
+    s.TextDocuments(documents = documents.toSeq.sortBy(_.uri))
+  }
+
+  private def batchCompileTextDocuments(
+      paths: Seq[AbsolutePath],
+      useFallbackCompiler: Boolean,
+      requireBuildTargetClasspath: Boolean = false,
+      maxRetries: Int = 3,
+  ): Seq[s.TextDocument] = {
+    try {
+      Await
+        .result(
+          compilers.batchSemanticdbTextDocuments(
+            paths,
+            EmptyCancelToken,
+            // intentionally smaller than the default PC timeout of 20s
+            Duration.ofSeconds(15),
+            useFallbackCompiler = useFallbackCompiler,
+            requireBuildTargetClasspath = requireBuildTargetClasspath,
+          ),
+          timeout,
+        )
+        .documents
+    } catch {
+      case _: CancellationException if maxRetries > 0 =>
+        batchCompileTextDocuments(
+          paths,
+          useFallbackCompiler,
+          requireBuildTargetClasspath,
+          maxRetries - 1,
+        )
+      case e @ (_: CancellationException | _: TimeoutException) =>
+        scribe.warn(
+          s"references: indexing ${paths.size} documents failed.",
+          e,
+        )
+        scribe.debug(s"indexed: ${paths.mkString(", ")}}", e)
+        Seq.empty[s.TextDocument]
+    }
+  }
+
   def references(
       params: ReferenceParams,
       findRealRange: AdjustRange = noAdjustRange,
@@ -837,33 +895,10 @@ class MbtReferenceProvider(
         if (needCompiler.isEmpty) {
           s.TextDocuments(documents = docs.toSeq)
         } else {
-          def fetchDocs(maxRetries: Int): Seq[s.TextDocument] = {
-            try {
-              Await
-                .result(
-                  compilers.batchSemanticdbTextDocuments(
-                    needCompiler.toSeq,
-                    EmptyCancelToken,
-                    // intentionally smaller than the default PC timeout of 20s
-                    Duration.ofSeconds(15),
-                    useFallbackCompiler = isMbtMode,
-                  ),
-                  timeout,
-                )
-                .documents
-            } catch {
-              case _: CancellationException if maxRetries > 0 =>
-                fetchDocs(maxRetries - 1)
-              case e @ (_: CancellationException | _: TimeoutException) =>
-                scribe.warn(
-                  s"references: indexing ${needCompiler.size} documents failed.",
-                  e,
-                )
-                scribe.debug(s"indexed: ${needCompiler.mkString(", ")}}", e)
-                Seq.empty[s.TextDocument]
-            }
-          }
-          val result = fetchDocs(maxRetries = 3)
+          val result = batchCompileTextDocuments(
+            needCompiler.toSeq,
+            useFallbackCompiler = isMbtMode,
+          )
           for {
             doc <- result
             path <- doc.uri.toAbsolutePathSafe

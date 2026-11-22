@@ -78,12 +78,26 @@ class TurbineClasspathFileManager(
       recurse: Boolean,
   ): java.lang.Iterable[JavaFileObject] = try {
     location match {
-      case StandardLocation.CLASS_PATH =>
+      case StandardLocation.CLASS_PATH
+          if kinds.contains(JavaFileObject.Kind.CLASS) =>
         val packageNames = packageName.split('.')
         val turbinePackageName = packageNames.mkString("/")
         val objects = new ju.ArrayList[JavaFileObject]()
-        val cp = workspaceClasspath()
         val isAddedBinaryName = new ju.HashSet[String]()
+        val cp = workspaceClasspath()
+        // Preserve M19 target-classpath precedence across both jars and
+        // directories in their declared order. Pending source updates remain
+        // preferred by javac's -Xprefer:source, not stale Turbine headers.
+        super.list(location, packageName, kinds, recurse).asScala.foreach {
+          obj =>
+            val binaryName =
+              super.inferBinaryName(location, obj).replace('.', '/')
+            if (
+              !isDeleted(binaryName) &&
+              (obj.getKind() != JavaFileObject.Kind.CLASS || isAddedBinaryName
+                .add(binaryName))
+            ) objects.add(obj)
+        }
         listPackageClasspath(
           projectClasspath,
           packageNames,
@@ -98,8 +112,8 @@ class TurbineClasspathFileManager(
             while (it.hasNext()) {
               val sym = it.next()
               val binaryName = sym.binaryName()
-              // Skip classes that have been deleted but not yet recompiled,
-              // or have a pending source on SOURCE_PATH (so javac uses the updated source)
+              // Skip classes that have been deleted but not yet recompiled.
+              // Pending source updates are preferred by javac's -Xprefer:source.
               if (!isDeleted(binaryName)) {
                 val bytes = cp.lowered.bytes().get(binaryName)
                 if (bytes != null && isAddedBinaryName.add(binaryName)) {
@@ -162,7 +176,7 @@ class TurbineClasspathFileManager(
       val lazyBytes = projectClasspath.env().get(cls)
       if (lazyBytes != null) {
         val binaryName = cls.binaryName()
-        if (isAddedBinaryName.add(binaryName)) {
+        if (!isDeleted(binaryName) && isAddedBinaryName.add(binaryName)) {
           fn(new TurbineClassfileObject(binaryName, lazyBytes.bytes()))
         }
       }

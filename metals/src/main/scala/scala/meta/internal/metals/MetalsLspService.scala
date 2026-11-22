@@ -1612,6 +1612,73 @@ abstract class MetalsLspService(
       }
     }
 
+  def javaDependencyBodies(
+      params: JavaDependencyBodiesParams
+  ): CompletableFuture[com.google.gson.JsonObject] =
+    CancelTokens.future { token =>
+      if (!JavaDependencyBodies.valid(params))
+        Future.successful(JavaDependencyBodies.unavailable("INVALID_REQUEST"))
+      else
+        compilers.javaReceiverTypes(
+          params.receiverParams,
+          token,
+          Some(params),
+        )
+    }
+
+  def javaReceiverTypes(
+      params: JavaReceiverTypesParams
+  ): CompletableFuture[com.google.gson.JsonObject] =
+    CancelTokens.future { token => compilers.javaReceiverTypes(params, token) }
+
+  def javaCompiledOrigins(
+      params: JavaReceiverTypesParams
+  ): CompletableFuture[com.google.gson.JsonObject] =
+    CancelTokens.future { token =>
+      compilers.javaReceiverTypes(
+        params,
+        token,
+        compiledOrigins = true,
+      )
+    }
+
+  def semanticdbTextDocuments(
+      params: SemanticdbTextDocumentsParams
+  ): Future[SemanticdbTextDocumentsResult] = Future {
+    val paths = params.uris.asScala.map(_.toAbsolutePath).toSeq
+    SemanticdbTextDocumentsResult.fromSemanticdb(
+      mbtReferenceProvider.compilerTextDocuments(paths)
+    )
+  }
+
+  def scalaCallableEvidence(
+      params: SemanticdbTextDocumentsParams,
+      token: scala.meta.pc.CancelToken,
+  ): Future[ScalaCallableEvidenceResult] = {
+    if (!ScalaCallableEvidence.valid(params))
+      Future.successful(ScalaCallableEvidence.unavailable("INVALID_REQUEST"))
+    else {
+      val paths = params.uris.asScala.map(_.toAbsolutePath).toSeq
+      token.checkCanceled()
+      compilers
+        .batchSemanticdbTextDocuments(
+          paths,
+          token,
+          java.time.Duration.ofSeconds(15),
+          useFallbackCompiler = false,
+          requireBuildTargetClasspath = true,
+        )
+        .map { documents =>
+          token.checkCanceled()
+          if (
+            documents.documents.map(_.uri).sorted != params.uris.asScala.sorted
+          )
+            ScalaCallableEvidence.unavailable("INCOMPLETE_DOCUMENT_CENSUS")
+          else ScalaCallableEvidence.fromSemanticdb(documents)
+        }
+    }
+  }
+
   private def notifyIncompleteSearch(
       isIncomplete: Boolean,
       processed: Int,
@@ -1632,6 +1699,34 @@ abstract class MetalsLspService(
       )
     }
   }
+
+  def scalaConstructorEvidence(
+      params: SemanticdbTextDocumentsParams,
+      token: scala.meta.pc.CancelToken,
+  ): Future[ScalaConstructorEvidenceResult] =
+    if (!ScalaConstructorEvidenceResult.valid(params))
+      Future.successful(
+        ScalaConstructorEvidenceResult.unavailable("INVALID_REQUEST")
+      )
+    else {
+      val paths = params.uris.asScala.map(_.toAbsolutePath).toSeq
+      compilers.scalaConstructorEvidence(paths, token).map { documents =>
+        token.checkCanceled()
+        if (documents.map(_.uri).sorted != params.uris.asScala.sorted)
+          ScalaConstructorEvidenceResult.unavailable(
+            "INCOMPLETE_DOCUMENT_CENSUS"
+          )
+        else
+          ScalaConstructorEvidenceResult.bounded(
+            ScalaConstructorEvidenceResult(
+              scala.meta.pc.ScalaConstructorEvidence.SCHEMA_VERSION,
+              "AVAILABLE",
+              "",
+              documents.sortBy(_.uri).asJava,
+            )
+          )
+      }
+    }
 
   private def getSortedLocations(referencesResult: List[ReferencesResult]) =
     referencesResult

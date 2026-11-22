@@ -98,6 +98,14 @@ class MetalsGlobal(
   } with m.internal.pc.classpath.MetalsBrowsingLoaders
 
   val compileUnitsCache = new CompileUnitsCache(5)
+  private val invalidatedCompilationUnits = mutable.Set.empty[String]
+
+  // Keep the unmarked document text with the cached unit: moving a completion
+  // cursor changes the synthetic source but must not invalidate typer state.
+  private class BufferCompilationUnit(
+      source: SourceFile,
+      val documentText: String
+  ) extends RichCompilationUnit(source)
   def didChange(uri: URI): Unit = {
     compileUnitsCache.didChange(uri)
   }
@@ -184,7 +192,26 @@ class MetalsGlobal(
   }
 
   class MetalsGlobalSemanticdbOps(val global: compiler.type)
-      extends SemanticdbOps
+      extends SemanticdbOps {
+    // SemanticDB document/synthetic serialization must use the same current
+    // overload as navigation. Its default indexOf=-1 disambiguator otherwise
+    // aliases a cached binary symbol to the first source overload.
+    override implicit def XtensionGSymbolMSymbol(
+        symbol: g.Symbol
+    ): XtensionGSymbolMSymbol = new XtensionGSymbolMSymbol(symbol) {
+      override def toSemantic: String =
+        try {
+          Option(symbol).flatMap(currentOverload).fold("") { current =>
+            if (current == symbol) super.toSemantic
+            else new XtensionGSymbolMSymbol(current).toSemantic
+          }
+        } catch {
+          // Preserve SemanticDB's interactive serialization failure boundary.
+          // Navigation's owner lookup still runs outside this boundary.
+          case NonFatal(_) if isInteractiveCompiler => ""
+        }
+    }
+  }
   lazy val semanticdbOps = new MetalsGlobalSemanticdbOps(compiler)
 
   def semanticdbSymbol(symbol: Symbol): String = {
@@ -832,6 +859,13 @@ class MetalsGlobal(
     richCompilationCache.remove(uriString)
   }
 
+  private[pc] def invalidatePrunedCompilationUnit(filename: String): Unit = {
+    // The source text is unchanged, but this unit no longer contains executable
+    // bodies. The next full request needs a fresh unit and a fresh typer epoch.
+    fullyCompiled.remove(filename)
+    invalidatedCompilationUnits.add(filename)
+  }
+
   private def remove(filename: String): Unit = {
     if (!richCompilationCache.contains(filename)) {
       fullyCompiled.remove(filename)
@@ -862,11 +896,36 @@ class MetalsGlobal(
       new MetalsSourceFile(filename, codeWithCursor.toCharArray)
     )
 
+    // A newly registered source can replace classfile-loaded symbols. Edits,
+    // eviction and body pruning also invalidate dependent nested signatures.
+    val changedSource = unitOfFile.get(unit.source.file).exists {
+      case previous: BufferCompilationUnit => previous.documentText != code
+      case previous =>
+        val unmarkedSource =
+          if (cursor.isDefined) new MetalsSourceFile(filename, code.toCharArray)
+          else unit.source
+        !util.Arrays.equals(previous.source.content, unmarkedSource.content)
+    }
+    val reenteredInvalidatedUnit = invalidatedCompilationUnits.remove(filename)
+    val previousRun = currentRun
+    if (
+      !unitOfFile.contains(
+        unit.source.file
+      ) || reenteredInvalidatedUnit || changedSource
+    ) {
+      newTyperRun()
+      // Retained source owners can still have lazy nested declarations. Namer's
+      // companionSymbolOf uses Run.compiles(owner) to avoid recursively forcing
+      // such an owner while it is being completed. Refresh types without losing
+      // the source ownership of declarations that remain in the compiler.
+      currentRun.symSource ++= previousRun.symSource
+    }
+
     val source =
       if (filename.isScalaScript || filename.isSbt || filename.isMill)
         ScriptSourceFile(unit.source.file, unit.source.content)
       else unit.source
-    val richUnit = new RichCompilationUnit(source)
+    val richUnit = new BufferCompilationUnit(source, code)
     // An explicitly queried document must be fully typed even when an earlier
     // request loaded and pruned it through the source path. A pruned SemanticDB
     // request re-registers the unit after addCompilationUnit returns.
@@ -874,7 +933,12 @@ class MetalsGlobal(
       PruneLateSourcesComponent.loadedFromSource.remove(source.file)
     }
     if (!isOutline && !willBeRemovedAfterUsing) {
-      compileUnitsCache.didGetUnit(filename).foreach(remove)
+      compileUnitsCache.didGetUnit(filename).foreach { expired =>
+        if (!richCompilationCache.contains(expired)) {
+          invalidatedCompilationUnits.add(expired)
+        }
+        remove(expired)
+      }
     }
     toBeRemoved.remove(richUnit.source.file)
     unitOfFile.get(richUnit.source.file) match {
@@ -887,17 +951,34 @@ class MetalsGlobal(
       case maybeOldUnit =>
         unitOfFile(richUnit.source.file) = richUnit
 
-        // A source-path unit can have symbols without an interactive unit.
-        // Re-enter generated companions when replacing its source, and unlink
-        // stale interactive declarations in the same pass.
-        currentRun.symSource.retain { (sym, file) =>
-          if (
-            maybeOldUnit.nonEmpty && sym.owner.hasPackageFlag && sym.isStale
-          ) {
-            sym.owner.info.decls unlink sym
+        maybeOldUnit.foreach { oldUnit =>
+          def unlinkStale(sym: Symbol): Unit = {
+            if (
+              sym != null && sym != NoSymbol && sym.owner.hasPackageFlag && sym.isStale
+            ) {
+              sym.owner.info.decls unlink sym
+            }
           }
-          file != source.file
+          previousRun.symSource.keys.foreach(unlinkStale)
+          // Intervening edits can rotate symSource without recompiling this
+          // file. Its cached trees still identify the declarations to unlink,
+          // without retaining another registry of symbols across typer runs.
+          def unlinkDeclarations(tree: Tree): Unit = tree match {
+            case PackageDef(_, stats) => stats.foreach(unlinkDeclarations)
+            case definition: ImplDef => unlinkStale(definition.symbol)
+            case _ =>
+          }
+          unlinkDeclarations(oldUnit.body)
+          if (oldUnit.lastBody ne oldUnit.body) {
+            unlinkDeclarations(oldUnit.lastBody)
+          }
         }
+        // A source-path unit can have symbols without an interactive unit.
+        // Re-enter generated companions when replacing its source.
+        val replacedSymbols = currentRun.symSource.collect {
+          case (sym, file) if file == source.file => sym
+        }
+        replacedSymbols.foreach(currentRun.symSource.remove)
         if (!isOutline) {
           fullyCompiled += filename
         } else {

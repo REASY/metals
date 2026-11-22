@@ -755,6 +755,41 @@ case class ScalaPresentationCompiler(
   }
   override def supportsBatchSemanticdbTextDocuments(): Boolean = true
 
+  override def scalaConstructorEvidence(
+      params: VirtualFileParams
+  ): CompletableFuture[scala.meta.pc.ScalaConstructorEvidence] =
+    compilerAccess.withInterruptableCompiler(
+      scala.meta.pc.ScalaConstructorEvidence.unavailable(
+        params.uri().toString,
+        "",
+        "COMPILER_UNAVAILABLE"
+      ),
+      params.token()
+    ) { pc =>
+      val compiler = pc.compiler(params)
+      val sourceFile = MetalsSourceFile.file(params.uri().toString())
+      val previouslyLoaded = compiler.unitOfFile.contains(sourceFile)
+      def isolatedEvidence(): scala.meta.pc.ScalaConstructorEvidence = {
+        val isolated = newCompiler()
+        try new ScalaConstructorEvidenceProvider(isolated, params).evidence()
+        finally isolated.askShutdown()
+      }
+      if (
+        compiler.PruneLateSourcesComponent.loadedFromSource.contains(sourceFile)
+      )
+        isolatedEvidence()
+      else {
+        val evidence =
+          new ScalaConstructorEvidenceProvider(compiler, params).evidence()
+        // Prior navigation can re-enter a source-path unit and remove its
+        // late-source marker while dependent nested types retain old symbols.
+        // Revalidate once; genuine source errors remain unavailable.
+        if (previouslyLoaded && evidence.reason == "COMPILER_ERROR")
+          isolatedEvidence()
+        else evidence
+      }
+    }(params.toQueryContext)
+
   /**
    * Process a sequence of files with the given provider, respecting the timeout.
    * Returns the processed documents.
@@ -781,10 +816,44 @@ case class ScalaPresentationCompiler(
         val fileParam = filesIterator.next()
         // we overwrite the URI because the provider relativizes the URI to the workspace path
         try {
-          docsBuffer += provider
-            .textDocument(fileParam)
-            .withUri(fileParam.uri().toString())
+          val sourceFile = MetalsSourceFile.file(fileParam.uri().toString())
+          val wasLoadedFromSourcePath =
+            provider.compiler.PruneLateSourcesComponent.loadedFromSource
+              .contains(sourceFile)
+          val previouslyLoaded =
+            provider.compiler.unitOfFile.contains(sourceFile)
+          def isolatedDocument(): s.TextDocument = {
+            val isolated = newCompiler()
+            try
+              new SemanticdbTextDocumentProvider(
+                isolated,
+                config.semanticdbCompilerOptions().asScala.toList
+              ).textDocument(fileParam)
+            finally isolated.askShutdown()
+          }
+          val document =
+            if (wasLoadedFromSourcePath) {
+              // Re-entering a source-path unit in the same compiler can leave
+              // dependent nested types tied to its earlier symbol identity.
+              // A new typer run here may interrupt companion completion, so
+              // type this document in an isolated compiler instead.
+              isolatedDocument()
+            } else {
+              val document = provider.textDocument(fileParam)
+              if (
+                previouslyLoaded && document.diagnostics.exists(
+                  _.severity == s.Diagnostic.Severity.ERROR
+                )
+              ) isolatedDocument()
+              else document
+            }
+          docsBuffer += document.withUri(fileParam.uri().toString())
         } catch {
+          case e: scala.reflect.internal.FatalError =>
+            // Let CompilerAccess retry the whole batch with a fresh compiler.
+            // An empty document would turn a recoverable compiler crash into
+            // an apparently complete but unusable semantic census.
+            throw e
           case NonFatal(e) =>
             logger.error(
               s"error getting text document for ${fileParam.uri()}",

@@ -77,6 +77,39 @@ class PcSemanticdbSuite extends BasePCSuite {
     )
   )
 
+  if (!scalaVersion.startsWith("3."))
+    test("full-body-after-pruned-document") {
+      val input = scala.meta.internal.metals.CompilerVirtualFileParams(
+        URI.create("file:///Pruned.scala"),
+        """|package example
+           |final case class Value(value: Int)
+           |object Sample {
+           |  def make: Value = Value(1)
+           |}
+           |""".stripMargin,
+        shouldReturnDiagnostics = true
+      )
+      def document(
+          prune: Boolean
+      ): scala.meta.internal.semanticdb.TextDocument =
+        scala.meta.internal.semanticdb.TextDocument.parseFrom(
+          presentationCompiler
+            .semanticdbTextDocument(
+              input.copy(shouldPruneSemanticdb = prune)
+            )
+            .get()
+        )
+      val before = document(prune = false)
+      val pruned = document(prune = true)
+      val after = document(prune = false)
+      assert(before.synthetics.nonEmpty)
+      assert(pruned.synthetics.isEmpty)
+      assertEquals(after.occurrences, before.occurrences)
+      assertEquals(after.synthetics, before.synthetics)
+      assertEquals(after.md5, before.md5)
+      assertEquals(after.diagnostics, before.diagnostics)
+    }
+
   def check(
       name: String,
       original: String,

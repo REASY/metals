@@ -167,6 +167,7 @@ public class SemanticdbVisitor extends TreePathScanner<Void, Void> {
     if (annotations != null) builder.addAllAnnotations(annotations);
 
     builder
+        .setLanguage(Semanticdb.Language.JAVA)
         .setProperties(semanticdbSymbolInfoProperties(sym))
         .setDisplayName(sym.getSimpleName().toString())
         .setAccess(semanticdbAccess(sym));
