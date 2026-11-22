@@ -2,7 +2,7 @@ package tests
 
 import scala.concurrent.Future
 
-import scala.meta.internal.metals.MetalsEnrichments._
+import scala.meta.internal.metals.MetalsEnrichments.*
 import scala.meta.internal.metals.SemanticdbTextDocumentsParams
 import scala.meta.internal.metals.config.ReferenceProviderConfig
 import scala.meta.internal.metals.config.UserConfiguration

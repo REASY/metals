@@ -3,10 +3,10 @@ package scala.meta.internal.metals
 import java.io.OutputStream
 import java.io.OutputStreamWriter
 import java.nio.charset.StandardCharsets
+import java.util as ju
 import java.util.Collections
-import java.{util => ju}
 
-import scala.jdk.CollectionConverters._
+import scala.jdk.CollectionConverters.*
 import scala.util.control.NoStackTrace
 
 import scala.meta.pc.CancelToken

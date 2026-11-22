@@ -3,9 +3,9 @@ package scala.meta.internal.metals.mbt
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util as ju
 import java.util.jar.JarEntry
 import java.util.jar.JarOutputStream
-import java.{util => ju}
 import javax.tools.DiagnosticCollector
 import javax.tools.JavaFileManager
 import javax.tools.JavaFileObject
@@ -15,8 +15,8 @@ import javax.tools.ToolProvider
 import scala.collection.parallel.mutable.ParArray
 import scala.concurrent.Await
 import scala.concurrent.ExecutionContext
-import scala.concurrent.duration._
-import scala.jdk.CollectionConverters._
+import scala.concurrent.duration.*
+import scala.jdk.CollectionConverters.*
 
 import scala.meta.internal.jpc.SourceJavaFileObject
 import scala.meta.internal.metals.Directories

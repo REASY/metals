@@ -2,17 +2,17 @@ package scala.meta.internal.metals
 
 import java.net.URI
 import java.nio.charset.StandardCharsets
-import java.{util => ju}
+import java.util as ju
 
-import scala.jdk.CollectionConverters._
+import scala.jdk.CollectionConverters.*
 import scala.util.Try
 
-import scala.meta.internal.{semanticdb => s}
+import scala.meta.internal.semanticdb as s
 
 import com.google.gson.Gson
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
-import org.eclipse.{lsp4j => l}
+import org.eclipse.lsp4j as l
 
 case class ScalaCallableEvidenceResult(
     schemaVersion: String,

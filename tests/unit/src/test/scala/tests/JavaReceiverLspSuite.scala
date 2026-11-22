@@ -6,7 +6,7 @@ import java.security.MessageDigest
 import scala.meta.internal.metals.JavaReceiverRange
 import scala.meta.internal.metals.JavaReceiverTypes
 import scala.meta.internal.metals.JavaReceiverTypesParams
-import scala.meta.internal.metals.MetalsEnrichments._
+import scala.meta.internal.metals.MetalsEnrichments.*
 
 import com.google.gson.Gson
 import com.google.gson.JsonObject

@@ -1,8 +1,10 @@
 # Codehop Metals build integration
 
-This fork branch combines upstream `main-v2` at
-`85d5cd138a976e7bd6eddbb45add8ecf2a453120` with reviewed fixes and the
-compiler extensions used by Codehop. It is the source input for a future
+This branch carries the published Codehop integration from
+`aaf92813b6ed19618af49cc44690fb588cbe8602` on upstream `main-v2` at
+`b8f53fbeabb112cf02a3fde9bb2160acabbf1c10`. The rebase consolidates the
+merge-based integration through `cddd3b90a8c` and replays the six subsequent
+fork commits. Upstream now includes #8984–#8987 and #8992. It is the source input for a future
 provider image; a source commit does not update an existing image.
 
 ## Reviewed fixes
@@ -68,7 +70,7 @@ single-case Turbine fixture is superseded by the reviewed generated-JAR suite.
 
 ## Integration validation
 
-The synchronized source passes 262 compiler tests on Scala 2.13.18, 227 on
+The pre-rebase integration passed 262 compiler tests on Scala 2.13.18, 227 on
 Scala 2.12.21, 135 server/LSP tests, and 73 Java PC tests on Corretto 21.0.5.
 Existing suite conditions report 16 and 23 ignored cross-compiler cases,
 respectively. Changed-source scalafmt and scalafixAll pass. The first-request

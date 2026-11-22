@@ -155,6 +155,7 @@ class CodehopSourcePathIdentitySuite extends BasePCSuite {
     }
 }
 
-class CodehopSourcePathIdentityFullSuite extends CodehopSourcePathIdentitySuite {
+class CodehopSourcePathIdentityFullSuite
+    extends CodehopSourcePathIdentitySuite {
   override protected def sourcePathMode: SourcePathMode = SourcePathMode.FULL
 }

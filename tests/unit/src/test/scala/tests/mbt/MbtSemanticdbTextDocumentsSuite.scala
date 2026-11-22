@@ -1,9 +1,9 @@
 package tests.mbt
 
-import scala.jdk.CollectionConverters._
+import scala.jdk.CollectionConverters.*
 
 import scala.meta.internal.metals.SemanticdbTextDocumentsResult
-import scala.meta.internal.{semanticdb => s}
+import scala.meta.internal.semanticdb as s
 
 class MbtSemanticdbTextDocumentsSuite
     extends BaseMbtReferenceSuite("mbt-semanticdb-text-documents") {

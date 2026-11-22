@@ -1,7 +1,7 @@
 package scala.meta.internal.metals
 
 import java.nio.charset.StandardCharsets
-import java.{util => ju}
+import java.util as ju
 
 import scala.meta.pc.ScalaConstructorEvidence
 

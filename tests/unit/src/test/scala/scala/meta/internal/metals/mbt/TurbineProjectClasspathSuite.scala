@@ -2,16 +2,16 @@ package scala.meta.internal.metals.mbt
 
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util as ju
 import java.util.jar.JarEntry
 import java.util.jar.JarOutputStream
-import java.{util => ju}
 import javax.tools.JavaFileObject
 import javax.tools.StandardLocation
 import javax.tools.ToolProvider
 
 import scala.collection.parallel.mutable.ParArray
 import scala.concurrent.ExecutionContext
-import scala.jdk.CollectionConverters._
+import scala.jdk.CollectionConverters.*
 
 import scala.meta.internal.metals.LoggerReportContext
 import scala.meta.internal.metals.ReportContext
@@ -26,7 +26,7 @@ import tests.TemporaryDirectoryFixture
 
 class TurbineProjectClasspathSuite extends munit.FunSuite {
   private val tmp = new TemporaryDirectoryFixture()
-  override def munitFixtures: Seq[AnyFixture[_]] = List(tmp)
+  override def munitFixtures: Seq[AnyFixture[?]] = List(tmp)
   implicit private val ec: ExecutionContext = ExecutionContext.global
   implicit private val rc: ReportContext = LoggerReportContext
 
@@ -51,7 +51,7 @@ class TurbineProjectClasspathSuite extends munit.FunSuite {
     }
     val arguments = List("-proc:none", "-d", output.toString) ++ paths
     assertEquals(
-      ToolProvider.getSystemJavaCompiler().run(null, null, null, arguments: _*),
+      ToolProvider.getSystemJavaCompiler().run(null, null, null, arguments*),
       0,
     )
     val classes = (for ((className, _) <- sources) yield {

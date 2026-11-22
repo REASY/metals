@@ -283,7 +283,6 @@ class HeaderCompilerSuite extends munit.FunSuite {
     )
   }
 
-
   test("retained-constructor-switch-preserves-constant-labels") {
     val layout = """|/example/Base.java
                     |package example;
@@ -363,7 +362,6 @@ class HeaderCompilerSuite extends munit.FunSuite {
        |}
        |""".stripMargin,
   )
-
 
   checkNoErrors(
     "incompatible-constant-literals-remain-pruned",

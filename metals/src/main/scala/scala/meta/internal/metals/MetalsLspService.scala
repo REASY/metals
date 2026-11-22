@@ -32,6 +32,7 @@ import scala.meta.internal.implementation.Supermethods
 import scala.meta.internal.io.FileIO
 import scala.meta.internal.metals.MetalsEnrichments.*
 import scala.meta.internal.metals.StdReportContext
+import scala.meta.internal.metals.buildserver.BuildServerConnection
 import scala.meta.internal.metals.callHierarchy.CallHierarchyProvider
 import scala.meta.internal.metals.clients.language.ConfiguredLanguageClient
 import scala.meta.internal.metals.clients.language.ForwardingMetalsBuildClient
@@ -47,7 +48,6 @@ import scala.meta.internal.metals.debug.DebugDiscovery
 import scala.meta.internal.metals.debug.DebugProvider
 import scala.meta.internal.metals.debug.DiscoveryFailures
 import scala.meta.internal.metals.doctor.Doctor
-import scala.meta.internal.metals.buildserver.BuildServerConnection
 import scala.meta.internal.metals.doctor.HeadDoctor
 import scala.meta.internal.metals.doctor.MetalsServiceInfo
 import scala.meta.internal.metals.findfiles.*
@@ -74,8 +74,8 @@ import scala.meta.internal.parsing.JavaTrees
 import scala.meta.internal.parsing.Trees
 import scala.meta.internal.rename.RenameProvider
 import scala.meta.internal.search.SymbolHierarchyOps
+import scala.meta.internal.semanticdb as s
 import scala.meta.internal.semanticdb.Scala.Symbols
-import scala.meta.internal.{semanticdb => s}
 import scala.meta.internal.worksheets.WorksheetProvider
 import scala.meta.io.AbsolutePath
 import scala.meta.metals.lsp.TextDocumentService

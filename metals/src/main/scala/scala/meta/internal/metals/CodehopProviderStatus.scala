@@ -1,6 +1,6 @@
 package scala.meta.internal.metals
 
-import java.{util => ju}
+import java.util as ju
 
 import ch.epfl.scala.bsp4j.BuildTargetIdentifier
 import org.eclipse.lsp4j.Location

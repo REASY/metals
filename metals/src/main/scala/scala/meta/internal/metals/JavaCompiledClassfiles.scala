@@ -11,7 +11,7 @@ import java.util.Base64
 import java.util.concurrent.CancellationException
 
 import scala.collection.mutable
-import scala.jdk.CollectionConverters._
+import scala.jdk.CollectionConverters.*
 import scala.util.Try
 import scala.util.control.NonFatal
 

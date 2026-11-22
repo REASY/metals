@@ -4,12 +4,12 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Paths
 
-import scala.jdk.CollectionConverters._
+import scala.jdk.CollectionConverters.*
 
 import scala.meta.internal.metals.ScalaCallableEvidence
 import scala.meta.internal.metals.SemanticdbTextDocumentsParams
 import scala.meta.internal.metals.SemanticdbTextDocumentsResult
-import scala.meta.internal.{semanticdb => s}
+import scala.meta.internal.semanticdb as s
 
 import com.google.gson.Gson
 

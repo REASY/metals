@@ -1,11 +1,11 @@
 package scala.meta.internal.metals
 
-import java.{util => ju}
+import java.util as ju
 
-import scala.meta.internal.{semanticdb => s}
+import scala.meta.internal.semanticdb as s
 
-import _root_.scala.jdk.CollectionConverters._
-import org.eclipse.{lsp4j => l}
+import _root_.scala.jdk.CollectionConverters.*
+import org.eclipse.lsp4j as l
 
 case class SemanticdbTextDocumentsParams(uris: ju.List[String])
 

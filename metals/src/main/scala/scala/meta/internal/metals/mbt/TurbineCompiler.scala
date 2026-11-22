@@ -17,7 +17,7 @@ import scala.collection.parallel.mutable.ParArray
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.concurrent.duration.FiniteDuration
-import scala.jdk.OptionConverters._
+import scala.jdk.OptionConverters.*
 import scala.util.control.NonFatal
 
 import scala.meta.internal.jdk.CollectionConverters.*
