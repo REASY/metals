@@ -2,6 +2,7 @@ package scala.meta.internal.metals
 
 import java.util as ju
 
+import scala.collection.mutable
 import scala.meta.internal.semanticdb as s
 
 import _root_.scala.jdk.CollectionConverters.*
@@ -22,6 +23,7 @@ case class SemanticdbTextDocument(
     diagnostics: ju.List[SemanticdbDiagnostic],
     occurrences: ju.List[SemanticdbSymbolOccurrence],
     symbols: ju.List[SemanticdbSymbolInformation],
+    synthetics: ju.List[SemanticdbSynthetic],
 )
 
 case class SemanticdbDiagnostic(
@@ -44,8 +46,17 @@ case class SemanticdbSymbolInformation(
     overriddenSymbols: ju.List[String],
 )
 
+case class SemanticdbSynthetic(
+    range: l.Range,
+    selectedSymbol: String,
+    hasImplicitConversion: Boolean,
+    hasImplicitArguments: Boolean,
+    hasMacroExpansion: Boolean,
+    symbols: ju.List[String],
+)
+
 object SemanticdbTextDocumentsResult {
-  val SchemaVersion = "metals-semanticdb-text-documents.v2"
+  val SchemaVersion = "metals-semanticdb-text-documents.v3"
   val BuildTargetPresentationCompilerGenerationKind =
     "BUILD_TARGET_PRESENTATION_COMPILER"
   val UnavailableGenerationKind = "UNAVAILABLE"
@@ -68,6 +79,7 @@ object SemanticdbTextDocumentsResult {
       document.diagnostics.map(toDiagnostic).asJava,
       document.occurrences.map(toOccurrence).asJava,
       document.symbols.map(toSymbolInformation).asJava,
+      document.synthetics.flatMap(toSynthetic).sortBy(syntheticSortKey).asJava,
     )
 
   private def isUnavailablePlaceholder(document: s.TextDocument): Boolean =
@@ -107,4 +119,105 @@ object SemanticdbTextDocumentsResult {
       new l.Position(range.startLine, range.startCharacter),
       new l.Position(range.endLine, range.endCharacter),
     )
+
+  private def toSynthetic(
+      synthetic: s.Synthetic
+  ): Option[SemanticdbSynthetic] =
+    synthetic.range.flatMap { range =>
+      val selectedSymbol = extractSelectedSymbol(synthetic.tree, range)
+      var hasImplicitConversion = false
+      var hasImplicitArguments = false
+      var hasMacroExpansion = false
+      val symbols = mutable.LinkedHashSet.empty[String]
+
+      def visit(tree: s.Tree): Unit = tree match {
+        case s.IdTree(symbol) =>
+          if (symbol.nonEmpty) symbols += symbol
+        case s.ApplyTree(function, arguments, _) =>
+          if (arguments.exists(containsOriginalTree)) {
+            hasImplicitConversion = true
+          }
+          if (containsOriginalTree(function) && arguments.nonEmpty) {
+            hasImplicitArguments = true
+          }
+          visit(function)
+          arguments.foreach(visit)
+        case s.SelectTree(qualifier, id) =>
+          visit(qualifier)
+          id.foreach(visit)
+        case s.TypeApplyTree(function, _) =>
+          visit(function)
+        case s.FunctionTree(parameters, body) =>
+          parameters.foreach(visit)
+          visit(body)
+        case s.MacroExpansionTree(beforeExpansion, _) =>
+          hasMacroExpansion = true
+          visit(beforeExpansion)
+        case _ => ()
+      }
+
+      visit(synthetic.tree)
+      if (
+        selectedSymbol.isEmpty &&
+        !hasImplicitConversion &&
+        !hasImplicitArguments &&
+        !hasMacroExpansion &&
+        symbols.isEmpty
+      ) {
+        None
+      } else {
+        Some(
+          SemanticdbSynthetic(
+            toRange(range),
+            selectedSymbol,
+            hasImplicitConversion,
+            hasImplicitArguments,
+            hasMacroExpansion,
+            symbols.toList.asJava,
+          )
+        )
+      }
+    }
+
+  private def extractSelectedSymbol(
+      tree: s.Tree,
+      expectedRange: s.Range,
+  ): String = tree match {
+    case s.SelectTree(
+          s.OriginalTree(original),
+          Some(s.IdTree(symbol)),
+        ) if original.forall(_ == expectedRange) && symbol.nonEmpty =>
+      symbol
+    case s.TypeApplyTree(function, _) =>
+      extractSelectedSymbol(function, expectedRange)
+    case s.ApplyTree(function, _, _) =>
+      extractSelectedSymbol(function, expectedRange)
+    case _ => ""
+  }
+
+  private def containsOriginalTree(tree: s.Tree): Boolean = tree match {
+    case _: s.OriginalTree => true
+    case s.ApplyTree(function, arguments, _) =>
+      containsOriginalTree(function) || arguments.exists(containsOriginalTree)
+    case s.SelectTree(qualifier, _) => containsOriginalTree(qualifier)
+    case s.TypeApplyTree(function, _) => containsOriginalTree(function)
+    case s.FunctionTree(_, body) => containsOriginalTree(body)
+    case s.MacroExpansionTree(beforeExpansion, _) =>
+      containsOriginalTree(beforeExpansion)
+    case _ => false
+  }
+
+  private def syntheticSortKey(
+      synthetic: SemanticdbSynthetic
+  ): (Int, Int, Int, Int, String, Boolean, Boolean, Boolean, String) = (
+    synthetic.range.getStart.getLine,
+    synthetic.range.getStart.getCharacter,
+    synthetic.range.getEnd.getLine,
+    synthetic.range.getEnd.getCharacter,
+    synthetic.selectedSymbol,
+    synthetic.hasImplicitConversion,
+    synthetic.hasImplicitArguments,
+    synthetic.hasMacroExpansion,
+    synthetic.symbols.asScala.mkString(","),
+  )
 }

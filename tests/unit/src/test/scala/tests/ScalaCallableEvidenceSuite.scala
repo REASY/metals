@@ -63,7 +63,7 @@ class ScalaCallableEvidenceSuite extends BaseSuite {
     )
     assertEquals(
       SemanticdbTextDocumentsResult.SchemaVersion,
-      "metals-semanticdb-text-documents.v2",
+      "metals-semanticdb-text-documents.v3",
     )
     assertEquals(
       ScalaCallableEvidence.SchemaVersion,

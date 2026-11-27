@@ -112,7 +112,7 @@ class MbtSemanticdbTextDocumentsSuite
       _ <- server.didOpenAndFocus(main)
       result <- server.semanticdbTextDocuments(List(main, api))
     } yield {
-      assertEquals(result.schemaVersion, "metals-semanticdb-text-documents.v2")
+      assertEquals(result.schemaVersion, "metals-semanticdb-text-documents.v3")
       val documents = result.documents.asScala
       assert(
         documents.forall(
@@ -182,7 +182,7 @@ class MbtSemanticdbTextDocumentsSuite
       _ <- server.didOpenAndFocus(main)
       result <- server.semanticdbTextDocuments(List(main))
     } yield {
-      assertEquals(result.schemaVersion, "metals-semanticdb-text-documents.v2")
+      assertEquals(result.schemaVersion, "metals-semanticdb-text-documents.v3")
       assert(
         result.documents.asScala.forall(
           _.generationKind == "BUILD_TARGET_PRESENTATION_COMPILER"
@@ -226,7 +226,7 @@ class MbtSemanticdbTextDocumentsSuite
       )
       result <- server.semanticdbTextDocuments(List(unowned))
     } yield {
-      assertEquals(result.schemaVersion, "metals-semanticdb-text-documents.v2")
+      assertEquals(result.schemaVersion, "metals-semanticdb-text-documents.v3")
       assertEquals(result.documents.asScala.toList, Nil)
     }
   }
@@ -339,6 +339,7 @@ class MbtSemanticdbTextDocumentsSuite
     assertEquals(document.diagnostics.asScala.toList, Nil)
     assertEquals(document.occurrences.asScala.toList, Nil)
     assertEquals(document.symbols.asScala.toList, Nil)
+    assertEquals(document.synthetics.asScala.toList, Nil)
   }
 
   test("empty-source-remains-compiler-generated") {
@@ -400,5 +401,196 @@ class MbtSemanticdbTextDocumentsSuite
     assertEquals(documents.head.md5, healthy.md5)
     assertEquals(documents.head.occurrences.asScala.head.symbol, "example/A#")
     assertEquals(documents.last.generationKind, "UNAVAILABLE")
+  }
+
+  test(
+    "synthetics-project-selections-implicits-macros-and-drop-pure-type-apply"
+  ) {
+    val monoRange = s.Range(1, 2, 1, 5)
+    val polyRange = s.Range(2, 2, 2, 6)
+    val convRange = s.Range(3, 2, 3, 5)
+    val implArgsRange = s.Range(4, 2, 4, 12)
+    val applyWithImplicitRange = s.Range(5, 2, 5, 8)
+    val pureTypeApplyRange = s.Range(6, 2, 6, 8)
+    val macroRange = s.Range(7, 2, 7, 10)
+    val source = s.TextDocument.defaultInstance
+      .withUri("file:///workspace/Synthetics.scala")
+      .withLanguage(s.Language.SCALA)
+      .withMd5("0123456789abcdef0123456789abcdef")
+      .withSynthetics(
+        Seq(
+          s.Synthetic(
+            Some(monoRange),
+            s.SelectTree(
+              s.OriginalTree(Some(monoRange)),
+              Some(s.IdTree("demo/Box.apply().")),
+            ),
+          ),
+          s.Synthetic(
+            Some(polyRange),
+            s.TypeApplyTree(
+              s.SelectTree(
+                s.OriginalTree(Some(polyRange)),
+                Some(s.IdTree("scala/Some.apply().")),
+              ),
+              Seq(s.TypeRef(s.NoType, "scala/Int#")),
+            ),
+          ),
+          s.Synthetic(
+            Some(convRange),
+            s.ApplyTree(
+              s.TypeApplyTree(
+                s.SelectTree(
+                  s.IdTree("scala/Predef."),
+                  Some(s.IdTree("scala/Predef.ArrowAssoc().")),
+                ),
+                Seq(s.TypeRef(s.NoType, "java/lang/String#")),
+              ),
+              Seq(s.OriginalTree(Some(convRange))),
+            ),
+          ),
+          s.Synthetic(
+            Some(implArgsRange),
+            s.ApplyTree(
+              s.OriginalTree(Some(implArgsRange)),
+              Seq(s.IdTree("demo/Ctx.ec.")),
+            ),
+          ),
+          s.Synthetic(
+            Some(applyWithImplicitRange),
+            s.ApplyTree(
+              s.TypeApplyTree(
+                s.SelectTree(
+                  s.OriginalTree(Some(applyWithImplicitRange)),
+                  Some(s.IdTree("demo/Builder.apply().")),
+                ),
+                Seq(s.TypeRef(s.NoType, "scala/Int#")),
+              ),
+              Seq(s.IdTree("demo/Ctx.ev.")),
+            ),
+          ),
+          s.Synthetic(
+            Some(pureTypeApplyRange),
+            s.TypeApplyTree(
+              s.OriginalTree(Some(pureTypeApplyRange)),
+              Seq(s.TypeRef(s.NoType, "scala/Int#")),
+            ),
+          ),
+          s.Synthetic(
+            Some(macroRange),
+            s.MacroExpansionTree(
+              s.OriginalTree(Some(macroRange)),
+              s.TypeRef(s.NoType, "scala/Unit#"),
+            ),
+          ),
+        )
+      )
+
+    val result = SemanticdbTextDocumentsResult.fromSemanticdb(
+      s.TextDocuments(Seq(source))
+    )
+    assertEquals(result.schemaVersion, "metals-semanticdb-text-documents.v3")
+    val synthetics = result.documents.asScala.head.synthetics.asScala.toList
+    assertEquals(synthetics.size, 6)
+
+    assertEquals(synthetics(0).selectedSymbol, "demo/Box.apply().")
+    assertEquals(synthetics(0).hasImplicitConversion, false)
+    assertEquals(synthetics(0).hasImplicitArguments, false)
+    assertEquals(synthetics(0).hasMacroExpansion, false)
+
+    assertEquals(synthetics(1).selectedSymbol, "scala/Some.apply().")
+    assertEquals(synthetics(1).hasImplicitConversion, false)
+    assertEquals(synthetics(1).hasImplicitArguments, false)
+
+    assertEquals(synthetics(2).selectedSymbol, "")
+    assertEquals(synthetics(2).hasImplicitConversion, true)
+    assertEquals(synthetics(2).hasImplicitArguments, false)
+    assertEquals(
+      synthetics(2).symbols.asScala.toList,
+      List("scala/Predef.", "scala/Predef.ArrowAssoc()."),
+    )
+
+    assertEquals(synthetics(3).selectedSymbol, "")
+    assertEquals(synthetics(3).hasImplicitConversion, false)
+    assertEquals(synthetics(3).hasImplicitArguments, true)
+    assertEquals(synthetics(3).symbols.asScala.toList, List("demo/Ctx.ec."))
+
+    assertEquals(synthetics(4).selectedSymbol, "demo/Builder.apply().")
+    assertEquals(synthetics(4).hasImplicitConversion, false)
+    assertEquals(synthetics(4).hasImplicitArguments, true)
+    assertEquals(
+      synthetics(4).symbols.asScala.toList,
+      List("demo/Builder.apply().", "demo/Ctx.ev."),
+    )
+
+    assertEquals(synthetics(5).selectedSymbol, "")
+    assertEquals(synthetics(5).hasMacroExpansion, true)
+  }
+
+  testLSP("batch-scala-synthetics-retain-apply-and-implicits") {
+    cleanWorkspace()
+    val main = "a/src/main/scala/fixture/Main.scala"
+    for {
+      _ <- initialize(
+        s"""|/metals.json
+            |{"a":{"scalaVersion":"2.13.18"}}
+            |/$main
+            |package fixture
+            |final case class Box(value: Int)
+            |object Main {
+            |  implicit val prefix: String = "hi"
+            |  def greet(name: String)(implicit p: String): String = p + name
+            |  def plain(x: Int): Int = x + 1
+            |  val a = Some(1)
+            |  val b = List(1, 2)
+            |  val c = Box(3)
+            |  val d = "k" -> 1
+            |  val e = greet("world")
+            |  val f = plain(1)
+            |}
+            |""".stripMargin
+      )
+      _ <- server.didOpenAndFocus(main)
+      result <- server.semanticdbTextDocuments(List(main))
+    } yield {
+      assertEquals(result.schemaVersion, "metals-semanticdb-text-documents.v3")
+      val doc = result.documents.asScala.head
+      val synthetics = doc.synthetics.asScala.toList
+      val selected = synthetics.map(_.selectedSymbol).filter(_.nonEmpty).toSet
+      assert(
+        selected.contains("scala/Some.apply()."),
+        clues(selected, synthetics),
+      )
+      assert(
+        selected.contains("scala/collection/IterableFactory#apply()."),
+        clues(selected, synthetics),
+      )
+      assert(
+        selected.contains("fixture/Box.apply()."),
+        clues(selected, synthetics),
+      )
+      assert(
+        synthetics.exists(syn =>
+          syn.hasImplicitConversion &&
+            syn.symbols.asScala.exists(_.contains("ArrowAssoc"))
+        ),
+        clues(synthetics),
+      )
+      assert(
+        synthetics.exists(syn =>
+          syn.hasImplicitArguments &&
+            syn.symbols.asScala.contains("fixture/Main.prefix.")
+        ),
+        clues(synthetics),
+      )
+      val plainLine = 11
+      assert(
+        !synthetics.exists(syn =>
+          syn.range.getStart.getLine == plainLine &&
+            (syn.hasImplicitConversion || syn.hasImplicitArguments)
+        ),
+        clues(synthetics),
+      )
+    }
   }
 }
